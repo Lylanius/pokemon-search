@@ -7,16 +7,12 @@ from statistics import median
 import os
 
 st.set_page_config(page_title="Pokémon Card Price Checker", layout="wide")
-st.markdown(
-    """
-    <div style="background: linear-gradient(135deg, #ff6b6b 0%, #ee5a6f 100%);
-                padding: 30px; border-radius: 12px; color: white; text-align: center;">
-        <h1>🎴 Pokémon Card Price Checker (UK)</h1>
-        <p>Live pricing from recent <strong>eBay sold</strong> listings</p>
-        <p style="font-size: 0.85rem; opacity: 0.9;">Runs via Streamlit (Python backend)</p>
-    </div>
-    """, unsafe_allow_html=True
-)
+st.title("🎴 Pokémon Card Price Checker (UK)")
+
+st.markdown("""
+Live pricing from recent **eBay sold** listings.  
+Runs via Streamlit (Python backend).
+""")
 
 # --- Sidebar options ---
 st.sidebar.header("Search Options")
@@ -25,11 +21,12 @@ num_results = st.sidebar.slider("Listings to fetch", min_value=5, max_value=200,
 trim_pct = st.sidebar.slider("Trim outliers (%)", min_value=0, max_value=40, value=10)
 bins_count = st.sidebar.slider("Histogram bins", min_value=5, max_value=40, value=12)
 
-# --- Apify Token from environment ---
+# --- Apify Token ---
 APIFY_TOKEN = os.environ.get("APIFY_TOKEN")
 
 if not APIFY_TOKEN:
-    st.warning("⚠️ APIFY_TOKEN is not set! Add it in Streamlit secrets or as an environment variable.")
+    st.warning("⚠️ APIFY_TOKEN is missing! Add it in Streamlit Secrets to fetch data.")
+    st.stop()  # Stop the app from running further until token is set
 
 if st.sidebar.button("Search") and card_query.strip():
     st.info(f"Fetching sold listings for '{card_query}'…")
@@ -92,7 +89,10 @@ if st.sidebar.button("Search") and card_query.strip():
                 df_display["Link"] = df_display["URL"].apply(lambda x: f"[Link]({x})" if x else "")
                 st.dataframe(df_display[["Title", "Price", "Date", "Condition", "Link"]])
 
+    except requests.exceptions.HTTPError as e:
+        if resp.status_code == 401:
+            st.error("⚠️ 401 Unauthorized: Your Apify token is invalid.")
+        else:
+            st.error(f"HTTP error {resp.status_code}: {resp.text}")
     except Exception as e:
-        st.error(f"Error fetching data: {e}")
-
-
+        st.error(f"Unexpected error: {e}")
