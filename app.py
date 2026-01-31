@@ -26,7 +26,7 @@ trim_pct = st.sidebar.slider("Trim outliers (%)", min_value=0, max_value=40, val
 bins_count = st.sidebar.slider("Histogram bins", min_value=5, max_value=40, value=12)
 
 # --- Apify Token from environment ---
-APIFY_TOKEN = "apify_api_0gpRxeCr7yuInE7EVg4Th3wukB6LhJ0lSI0l"
+APIFY_TOKEN = os.environ.get("APIFY_TOKEN")
 
 if not APIFY_TOKEN:
     st.warning("⚠️ APIFY_TOKEN is not set! Add it in Streamlit secrets or as an environment variable.")
@@ -94,4 +94,5 @@ if st.sidebar.button("Search") and card_query.strip():
 
     except Exception as e:
         st.error(f"Error fetching data: {e}")
+
 
