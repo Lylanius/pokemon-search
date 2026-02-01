@@ -13,16 +13,16 @@ st.set_page_config(page_title="Pokémon Card Price Tracker", layout="wide")
 @st.cache_data(ttl=3600)
 def fetch_cards_from_scryfall(name):
     """
-    Fetch Pokémon cards from Scryfall by name.
-    Works for exact and partial matches, e.g., 'charizard' or 'charizard gx'.
-    Handles pagination.
+    Fetch Pokémon cards from Scryfall using partial/fuzzy name search.
+    Works for 'charizard', 'charizard gx', etc.
     """
     name = name.strip()
     if not name:
         return []
 
-    query = urllib.parse.quote(f'name:"{name}"')
-    url = f"https://api.scryfall.com/cards/search?q={query}"
+    # Fuzzy search using wildcard *
+    query = urllib.parse.quote(f'name:{name}*')
+    url = f"https://api.scryfall.com/cards/search?q={query}'
 
     resp = requests.get(url)
     if resp.status_code != 200:
@@ -54,7 +54,7 @@ def fetch_sold_prices_ebay(card_name, appid):
         "SECURITY-APPNAME": appid,
         "RESPONSE-DATA-FORMAT": "JSON",
         "keywords": f"pokemon {card_name}",
-        "categoryId": "183454",  # Pokémon TCG
+        "categoryId": "183454",
         "itemFilter(0).name": "SoldItemsOnly",
         "itemFilter(0).value": "true",
         "paginationInput.entriesPerPage": "100"
@@ -67,9 +67,6 @@ def fetch_sold_prices_ebay(card_name, appid):
         return []
 
 def extract_prices_from_ebay(items, days):
-    """
-    Extract prices within the timescale
-    """
     prices = []
     cutoff = datetime.now() - timedelta(days=days)
     for it in items:
@@ -92,7 +89,7 @@ def timescale_to_days(timescale_str):
 
 st.title("🎴 Pokémon Card Price Tracker")
 st.markdown("""
-Enter the name of a Pokémon card and see recent sold prices, along with images and stats.
+Enter a Pokémon card name to see recent sold prices, images, and stats.
 """)
 
 col1, col2 = st.columns([3,1])
@@ -101,64 +98,81 @@ with col1:
 with col2:
     timescale = st.selectbox("Recent sales timescale:", ["7 Days", "30 Days", "90 Days", "365 Days"])
 
-# ✅ Load eBay App ID from Streamlit secrets
+# Load eBay App ID from Streamlit secrets
 try:
     EBAY_APP_ID = st.secrets["ebay"]["app_id"]
 except KeyError:
     st.error("eBay App ID not found in secrets! Please add it in Streamlit Cloud settings.")
     st.stop()
 
-if st.button("Search"):
-    if not card_query:
-        st.error("Please enter a card name.")
-    else:
-        st.info("Searching cards...")
+# Load More functionality
+if "card_index" not in st.session_state:
+    st.session_state["card_index"] = 0
 
-        # -- 1) Fetch cards from Scryfall
+CARDS_PER_LOAD = 12  # cards per batch
+
+if st.button("Search") or st.session_state.get("search_triggered", False):
+    if card_query:
+        st.session_state["search_triggered"] = True
+        st.session_state["card_index"] = 0
+
+        # Fetch Scryfall cards
         cards = fetch_cards_from_scryfall(card_query)
         if not cards:
             st.error("No cards found.")
         else:
-            st.success(f"Found {len(cards)} cards.")
-            days = timescale_to_days(timescale)
+            st.session_state["cards"] = cards
+    else:
+        st.error("Please enter a card name.")
 
-            # Display cards in 3-column grid
-            for i in range(0, len(cards), 3):
-                cols = st.columns(3)
-                for j, card in enumerate(cards[i:i+3]):
-                    img_url = card.get("images", {}).get("small", "")
-                    name = card.get("name", "Unknown")
-                    set_code = card.get("set", "")
-                    number = card.get("collector_number", "")
+# Display cards if any
+cards = st.session_state.get("cards", [])
+if cards:
+    days = timescale_to_days(timescale)
+    start = st.session_state["card_index"]
+    end = start + CARDS_PER_LOAD
+    batch = cards[start:end]
 
-                    # Fetch eBay sold prices
-                    items = fetch_sold_prices_ebay(f"{name} {set_code} {number}", EBAY_APP_ID)
-                    prices = extract_prices_from_ebay(items, days)
+    for i in range(0, len(batch), 3):
+        cols = st.columns(3)
+        for j, card in enumerate(batch[i:i+3]):
+            img_url = card.get("images", {}).get("small", "")
+            name = card.get("name", "Unknown")
+            set_code = card.get("set", "")
+            number = card.get("collector_number", "")
 
-                    highest = max(prices) if prices else None
-                    lowest = min(prices) if prices else None
-                    avg = statistics.mean(prices) if prices else None
+            # Fetch eBay prices
+            items = fetch_sold_prices_ebay(f"{name} {set_code} {number}", EBAY_APP_ID)
+            prices = extract_prices_from_ebay(items, days)
 
-                    with cols[j]:
-                        # Image with overlayed highest price
-                        if img_url:
-                            if highest:
-                                st.markdown(f"""
-                                <div style="position: relative; display: inline-block;">
-                                  <img src="{img_url}" width="200"/>
-                                  <div style="position: absolute; top: 8px; right: 8px; background: rgba(255,255,255,0.9); padding: 4px;
-                                              border-radius: 4px; font-weight: bold; font-size:14px;">
-                                      ${highest:.2f}
-                                  </div>
-                                </div>
-                                """, unsafe_allow_html=True)
-                            else:
-                                st.image(img_url, width=200)
+            highest = max(prices) if prices else None
+            lowest = min(prices) if prices else None
+            avg = statistics.mean(prices) if prices else None
 
-                        # Card info
-                        st.markdown(f"**{name} ({set_code}-{number})**")
-                        if prices:
-                            st.write(f"Lowest: ${lowest:.2f}")
-                            st.write(f"Average: ${avg:.2f}")
-                        else:
-                            st.write("No recent sales")
+            with cols[j]:
+                if img_url:
+                    if highest:
+                        st.markdown(f"""
+                        <div style="position: relative; display: inline-block;">
+                          <img src="{img_url}" width="200"/>
+                          <div style="position: absolute; top: 8px; right: 8px; background: rgba(255,255,255,0.9); padding: 4px;
+                                      border-radius: 4px; font-weight: bold; font-size:14px;">
+                              ${highest:.2f}
+                          </div>
+                        </div>
+                        """, unsafe_allow_html=True)
+                    else:
+                        st.image(img_url, width=200)
+
+                st.markdown(f"**{name} ({set_code}-{number})**")
+                if prices:
+                    st.write(f"Lowest: ${lowest:.2f}")
+                    st.write(f"Average: ${avg:.2f}")
+                else:
+                    st.write("No recent sales")
+
+    # Load more button
+    if end < len(cards):
+        if st.button("Load more cards"):
+            st.session_state["card_index"] += CARDS_PER_LOAD
+            st.experimental_rerun()
