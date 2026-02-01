@@ -1,178 +1,339 @@
-import streamlit as st
+import os
+import math
+import html
 import requests
-import statistics
-from datetime import datetime, timedelta
-import urllib.parse
+import pandas as pd
+import streamlit as st
+from datetime import datetime, timedelta, timezone
 
-st.set_page_config(page_title="Pokémon Card Price Tracker", layout="wide")
+st.set_page_config(page_title="Pokémon Sold Price Finder", layout="wide")
 
-# -------------------------------
-# Helper Functions
-# -------------------------------
+# -----------------------------
+# Configuration / Secrets
+# -----------------------------
+EBAY_APP_ID = st.secrets.get("EBAY_APP_ID") or st.secrets.get("ebay_app_id") or st.secrets.get("EBAY_APPID")
+POKEMONTCG_API_KEY = st.secrets.get("POKEMONTCG_API_KEY", None)
 
-@st.cache_data(ttl=3600)
-def fetch_cards_from_scryfall(name):
+EBAY_GLOBAL_ID = "EBAY-GB"  # UK site; adjust if you want EBAY-US etc.
+FINDING_ENDPOINT = "https://svcs.ebay.com/services/search/FindingService/v1"
+POKEMONTCG_ENDPOINT = "https://api.pokemontcg.io/v2/cards"
+
+# -----------------------------
+# Helpers
+# -----------------------------
+def money_fmt(value, currency="GBP"):
+    if value is None or (isinstance(value, float) and math.isnan(value)):
+        return "—"
+    return f"{currency} {value:,.2f}"
+
+@st.cache_data(ttl=60 * 30)  # 30 minutes
+def pokemontcg_search_cards(query: str, page_size: int = 24):
+    headers = {}
+    if POKEMONTCG_API_KEY:
+        headers["X-Api-Key"] = POKEMONTCG_API_KEY
+
+    # Use Lucene-like query syntax: name:"..."
+    q = f'name:"{query}"'
+    params = {
+        "q": q,
+        "page": 1,
+        "pageSize": page_size,
+        # Only bring back fields we need to keep payload smaller
+        "select": "id,name,number,set,images,rarity,tcgplayer",
+        "orderBy": "set.releaseDate"
+    }
+    r = requests.get(POKEMONTCG_ENDPOINT, headers=headers, params=params, timeout=30)
+    r.raise_for_status()
+    data = r.json().get("data", [])
+    return data
+
+def build_ebay_keywords(card):
     """
-    Fetch Pokémon cards from Scryfall using partial/fuzzy name search.
-    Works for 'charizard', 'charizard gx', etc.
+    Keywords tuned to reduce junk. You can refine this heavily over time.
     """
-    name = name.strip()
-    if not name:
-        return []
+    name = card.get("name", "")
+    number = card.get("number", "")
+    set_name = (card.get("set") or {}).get("name", "")
+    rarity = card.get("rarity", "")
 
-    # Fuzzy search using wildcard *
-    query = urllib.parse.quote(f'name:{name}*')
-    url = f"https://api.scryfall.com/cards/search?q={query}'
+    # Example search phrase:
+    # "Charizard" "Base Set" "4/102" Pokémon card
+    # (number can be e.g. "4" so we include just number and optionally total if known)
+    total = (card.get("set") or {}).get("printedTotal") or (card.get("set") or {}).get("total")
+    num_str = f"{number}/{total}" if total else str(number)
 
-    resp = requests.get(url)
-    if resp.status_code != 200:
-        return []
+    # Exclusions help remove bulk lots
+    excluded = "-lot -bundle -collection -proxy -digital -code"
+    keywords = f'"{name}" "{set_name}" "{num_str}" pokemon card {excluded}'
+    # If no total, omit 4/102 pattern
+    if not total:
+        keywords = f'"{name}" "{set_name}" "{number}" pokemon card {excluded}'
+    return keywords
 
-    data = resp.json()
-    cards = data.get("data", [])
-
-    # Handle pagination
-    while data.get("has_more"):
-        next_page = data.get("next_page")
-        if not next_page:
-            break
-        resp = requests.get(next_page)
-        data = resp.json()
-        cards.extend(data.get("data", []))
-
-    return cards
-
-@st.cache_data(ttl=1800)
-def fetch_sold_prices_ebay(card_name, appid):
+@st.cache_data(ttl=60 * 20)  # 20 minutes
+def ebay_find_completed_items(keywords: str, days: int = 30, entries: int = 50, include_shipping: bool = True):
     """
-    Fetch sold listings from eBay Completed Items API
+    Attempts to use Finding API findCompletedItems.
+    NOTE: This endpoint is often restricted for many apps.
     """
-    url = "https://svcs.ebay.com/services/search/FindingService/v1"
+    if not EBAY_APP_ID:
+        return {"ok": False, "error": "Missing EBAY_APP_ID in Streamlit secrets.", "items": []}
+
+    end_to = datetime.now(timezone.utc)
+    end_from = end_to - timedelta(days=days)
+
+    # Finding API uses itemFilter with names like EndTimeFrom/EndTimeTo.  [9](https://developer.ebay.com/devzone//finding/callref/extra/fnditmsadvncd.rqst.tmfltr.nm.html)
     params = {
         "OPERATION-NAME": "findCompletedItems",
-        "SERVICE-VERSION": "1.0.0",
-        "SECURITY-APPNAME": appid,
+        "SERVICE-VERSION": "1.13.0",
+        "SECURITY-APPNAME": EBAY_APP_ID,
+        "GLOBAL-ID": EBAY_GLOBAL_ID,
         "RESPONSE-DATA-FORMAT": "JSON",
-        "keywords": f"pokemon {card_name}",
-        "categoryId": "183454",
+        "REST-PAYLOAD": "",
+        "keywords": keywords,
+        "paginationInput.entriesPerPage": str(entries),
+        "sortOrder": "EndTimeSoonest",
         "itemFilter(0).name": "SoldItemsOnly",
         "itemFilter(0).value": "true",
-        "paginationInput.entriesPerPage": "100"
+        "itemFilter(1).name": "EndTimeFrom",
+        "itemFilter(1).value": end_from.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+        "itemFilter(2).name": "EndTimeTo",
+        "itemFilter(2).value": end_to.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
     }
-    r = requests.get(url, params=params)
+
     try:
-        items = r.json()["findCompletedItemsResponse"][0]["searchResult"][0]["item"]
-        return items
-    except:
-        return []
+        r = requests.get(FINDING_ENDPOINT, params=params, timeout=30)
+        r.raise_for_status()
+        payload = r.json()
 
-def extract_prices_from_ebay(items, days):
-    prices = []
-    cutoff = datetime.now() - timedelta(days=days)
-    for it in items:
-        try:
-            end_time = datetime.strptime(it["listingInfo"][0]["endTime"][0], "%Y-%m-%dT%H:%M:%S.%fZ")
-            if end_time < cutoff:
-                continue
-            price = float(it["sellingStatus"][0]["currentPrice"][0]["__value__"])
-            prices.append(price)
-        except:
-            continue
-    return prices
+        resp = payload.get("findCompletedItemsResponse", [])
+        if not resp:
+            return {"ok": False, "error": "Unexpected response shape from eBay Finding API.", "items": []}
 
-def timescale_to_days(timescale_str):
-    return int(timescale_str.split()[0])
+        ack = (resp[0].get("ack") or [""])[0]
+        if ack != "Success":
+            # Many apps get Security errors / call restricted.
+            err = resp[0].get("errorMessage", {})
+            return {"ok": False, "error": f"eBay ack={ack}. error={err}", "items": []}
 
-# -------------------------------
-# Streamlit UI
-# -------------------------------
+        search_result = resp[0].get("searchResult", [{}])[0]
+        items = search_result.get("item", []) or []
 
-st.title("🎴 Pokémon Card Price Tracker")
-st.markdown("""
-Enter a Pokémon card name to see recent sold prices, images, and stats.
-""")
+        normalized = []
+        for it in items:
+            title = (it.get("title") or [""])[0]
+            url = (it.get("viewItemURL") or [""])[0]
+            end_time = ((it.get("listingInfo") or [{}])[0].get("endTime") or [""])[0]
 
-col1, col2 = st.columns([3,1])
-with col1:
-    card_query = st.text_input("Enter Pokémon card name:")
-with col2:
-    timescale = st.selectbox("Recent sales timescale:", ["7 Days", "30 Days", "90 Days", "365 Days"])
+            selling_status = (it.get("sellingStatus") or [{}])[0]
+            price_obj = (selling_status.get("currentPrice") or [{}])[0]
+            price = float(price_obj.get("__value__", price_obj.get("#text", 0.0)) or 0.0)
+            currency = price_obj.get("@currencyId", price_obj.get("currencyId", "GBP"))
 
-# Load eBay App ID from Streamlit secrets
-try:
-    EBAY_APP_ID = st.secrets["ebay"]["app_id"]
-except KeyError:
-    st.error("eBay App ID not found in secrets! Please add it in Streamlit Cloud settings.")
-    st.stop()
+            ship_cost = 0.0
+            ship = (it.get("shippingInfo") or [{}])[0]
+            ship_cost_obj = (ship.get("shippingServiceCost") or [{}])
+            if ship_cost_obj:
+                ship_cost_obj = ship_cost_obj[0]
+                try:
+                    ship_cost = float(ship_cost_obj.get("__value__", ship_cost_obj.get("#text", 0.0)) or 0.0)
+                except Exception:
+                    ship_cost = 0.0
 
-# Load More functionality
-if "card_index" not in st.session_state:
-    st.session_state["card_index"] = 0
+            total_price = price + ship_cost if include_shipping else price
 
-CARDS_PER_LOAD = 12  # cards per batch
+            normalized.append({
+                "title": title,
+                "end_time": end_time,
+                "price": price,
+                "shipping": ship_cost,
+                "total_price": total_price,
+                "currency": currency,
+                "url": url
+            })
 
-if st.button("Search") or st.session_state.get("search_triggered", False):
-    if card_query:
-        st.session_state["search_triggered"] = True
-        st.session_state["card_index"] = 0
+        # Filter to a single currency for sane stats
+        if normalized:
+            # choose the most common currency
+            cur = pd.Series([x["currency"] for x in normalized]).mode().iloc[0]
+            normalized = [x for x in normalized if x["currency"] == cur]
+        return {"ok": True, "error": None, "items": normalized}
 
-        # Fetch Scryfall cards
-        cards = fetch_cards_from_scryfall(card_query)
-        if not cards:
-            st.error("No cards found.")
+    except requests.HTTPError as e:
+        return {"ok": False, "error": f"HTTP error from eBay: {e}", "items": []}
+    except Exception as e:
+        return {"ok": False, "error": f"Error calling eBay: {e}", "items": []}
+
+def summarize_prices(items):
+    if not items:
+        return None
+    df = pd.DataFrame(items)
+    cur = df["currency"].iloc[0] if "currency" in df.columns and len(df) else "GBP"
+    return {
+        "currency": cur,
+        "count": len(df),
+        "high": float(df["total_price"].max()),
+        "low": float(df["total_price"].min()),
+        "avg": float(df["total_price"].mean()),
+        "df": df.sort_values("end_time", ascending=False)
+    }
+
+def card_tile_html(img_url, name, subtitle, price_text):
+    """
+    Creates a tile similar to pokemonpricetracker style:
+    image, price overlay top-right, name and subtitle under.
+    """
+    safe_name = html.escape(name)
+    safe_sub = html.escape(subtitle)
+    safe_price = html.escape(price_text)
+
+    return f"""
+    <div style="width: 100%; max-width: 220px; margin: 0 auto;">
+      <div style="
+        position: relative;
+        border-radius: 12px;
+        overflow: hidden;
+        border: 1px solid rgba(255,255,255,0.08);
+        box-shadow: 0 6px 18px rgba(0,0,0,0.25);
+        background: #111;
+      ">
+        <img src="{img_url}" style="display:block; width: 100%; height:auto;" />
+        <div style="
+          position: absolute;
+          top: 10px;
+          right: 10px;
+          background: rgba(0,0,0,0.72);
+          color: white;
+          padding: 6px 10px;
+          border-radius: 10px;
+          font-weight: 700;
+          font-size: 13px;
+          backdrop-filter: blur(6px);
+        ">{safe_price}</div>
+      </div>
+      <div style="padding: 8px 2px 0 2px;">
+        <div style="font-weight: 700; line-height: 1.2;">{safe_name}</div>
+        <div style="opacity: 0.75; font-size: 13px; line-height: 1.2;">{safe_sub}</div>
+      </div>
+    </div>
+    """
+
+# -----------------------------
+# Sidebar controls
+# -----------------------------
+st.sidebar.header("Filters")
+days = st.sidebar.select_slider("Timescale (days)", options=[7, 14, 30, 60, 90], value=30)
+include_shipping = st.sidebar.toggle("Include shipping in price", value=True)
+max_cards = st.sidebar.slider("Max card variants to show", 6, 36, 18, step=6)
+max_sales = st.sidebar.slider("Max sold listings per card (eBay)", 10, 100, 40, step=10)
+
+st.title("Pokémon Card Sold Prices (eBay) + Card Grid")
+
+query = st.text_input("Search for a card (e.g., Charizard, Pikachu VMAX, Umbreon)", value="Charizard")
+
+if query:
+    with st.spinner("Searching Pokémon card database…"):
+        cards = pokemontcg_search_cards(query, page_size=max_cards)
+
+    if not cards:
+        st.warning("No cards found. Try a different query.")
+        st.stop()
+
+    st.caption("Tip: Searches return multiple printings across sets. The grid shows each printing and its sold-price summary.")
+
+    # Build grid
+    cols_per_row = 6 if st.session_state.get("wide", True) else 4
+    cols = st.columns(cols_per_row)
+
+    # We'll also collect expanded details below
+    detail_sections = []
+
+    for idx, card in enumerate(cards):
+        col = cols[idx % cols_per_row]
+
+        img = (card.get("images") or {}).get("small") or (card.get("images") or {}).get("large")
+        name = card.get("name", "Unknown")
+        number = card.get("number", "?")
+        set_name = (card.get("set") or {}).get("name", "Unknown set")
+
+        subtitle = f"{number} • {set_name}"
+
+        keywords = build_ebay_keywords(card)
+        ebay = ebay_find_completed_items(keywords, days=days, entries=max_sales, include_shipping=include_shipping)
+        summary = summarize_prices(ebay["items"]) if ebay["ok"] else None
+
+        if summary:
+            price_text = f"{summary['currency']} {summary['high']:.2f}"
         else:
-            st.session_state["cards"] = cards
-    else:
-        st.error("Please enter a card name.")
+            # fallback to tcgplayer market if present
+            tcgplayer = card.get("tcgplayer", {}) or {}
+            prices = (tcgplayer.get("prices") or {})
+            # pick first finish available
+            market = None
+            for finish, p in prices.items():
+                if isinstance(p, dict) and p.get("market") is not None:
+                    market = p.get("market")
+                    break
+            if market is not None:
+                price_text = f"TCG Mkt {market:.2f}"
+            else:
+                price_text = "No sold data"
 
-# Display cards if any
-cards = st.session_state.get("cards", [])
-if cards:
-    days = timescale_to_days(timescale)
-    start = st.session_state["card_index"]
-    end = start + CARDS_PER_LOAD
-    batch = cards[start:end]
+        tile = card_tile_html(img, name, subtitle, price_text)
+        with col:
+            st.markdown(tile, unsafe_allow_html=True)
 
-    for i in range(0, len(batch), 3):
-        cols = st.columns(3)
-        for j, card in enumerate(batch[i:i+3]):
-            img_url = card.get("images", {}).get("small", "")
+            # Expand button
+            show = st.button(f"Details #{idx+1}", key=f"btn_{card.get('id')}_{idx}")
+            if show:
+                detail_sections.append((card, ebay, summary, keywords))
+
+    # Detailed panels
+    if detail_sections:
+        st.divider()
+        st.header("Details")
+
+        for card, ebay, summary, keywords in detail_sections:
             name = card.get("name", "Unknown")
-            set_code = card.get("set", "")
-            number = card.get("collector_number", "")
+            number = card.get("number", "?")
+            set_name = (card.get("set") or {}).get("name", "Unknown set")
+            img = (card.get("images") or {}).get("large") or (card.get("images") or {}).get("small")
 
-            # Fetch eBay prices
-            items = fetch_sold_prices_ebay(f"{name} {set_code} {number}", EBAY_APP_ID)
-            prices = extract_prices_from_ebay(items, days)
+            st.subheader(f"{name} — {number} • {set_name}")
+            left, right = st.columns([1, 2])
+            with left:
+                st.image(img, use_container_width=True)
+                st.code(keywords, language="text")
 
-            highest = max(prices) if prices else None
-            lowest = min(prices) if prices else None
-            avg = statistics.mean(prices) if prices else None
+            with right:
+                if ebay["ok"] and summary:
+                    c = summary["currency"]
+                    m1, m2, m3, m4 = st.columns(4)
+                    m1.metric("Highest", money_fmt(summary["high"], c))
+                    m2.metric("Average", money_fmt(summary["avg"], c))
+                    m3.metric("Lowest", money_fmt(summary["low"], c))
+                    m4.metric("Samples", f"{summary['count']}")
 
-            with cols[j]:
-                if img_url:
-                    if highest:
-                        st.markdown(f"""
-                        <div style="position: relative; display: inline-block;">
-                          <img src="{img_url}" width="200"/>
-                          <div style="position: absolute; top: 8px; right: 8px; background: rgba(255,255,255,0.9); padding: 4px;
-                                      border-radius: 4px; font-weight: bold; font-size:14px;">
-                              ${highest:.2f}
-                          </div>
-                        </div>
-                        """, unsafe_allow_html=True)
-                    else:
-                        st.image(img_url, width=200)
+                    df = summary["df"].copy()
+                    df["end_time"] = pd.to_datetime(df["end_time"], errors="coerce")
+                    df["end_time"] = df["end_time"].dt.strftime("%Y-%m-%d %H:%M")
+                    df["total_price"] = df["total_price"].round(2)
+                    df["shipping"] = df["shipping"].round(2)
+                    df["price"] = df["price"].round(2)
 
-                st.markdown(f"**{name} ({set_code}-{number})**")
-                if prices:
-                    st.write(f"Lowest: ${lowest:.2f}")
-                    st.write(f"Average: ${avg:.2f}")
+                    st.dataframe(
+                        df[["end_time", "title", "price", "shipping", "total_price", "currency", "url"]],
+                        use_container_width=True,
+                        hide_index=True
+                    )
                 else:
-                    st.write("No recent sales")
-
-    # Load more button
-    if end < len(cards):
-        if st.button("Load more cards"):
-            st.session_state["card_index"] += CARDS_PER_LOAD
-            st.experimental_rerun()
+                    st.error(
+                        "Could not fetch sold listings from eBay (likely restricted). "
+                        "If you want official sold-history via API, you’ll need Marketplace Insights access."
+                    )
+                    st.caption(f"Raw error: {ebay.get('error')}")
+                    # show tcgplayer fallback if present
+                    tcgplayer = card.get("tcgplayer", {}) or {}
+                    if tcgplayer:
+                        st.write("TCGplayer pricing (fallback from Pokémon TCG API dataset):")
+                        st.json(tcgplayer.get("prices", {}))
