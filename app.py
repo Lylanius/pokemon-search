@@ -2,6 +2,7 @@ import streamlit as st
 import requests
 import statistics
 from datetime import datetime, timedelta
+import urllib.parse
 
 st.set_page_config(page_title="Pokémon Card Price Tracker", layout="wide")
 
@@ -11,14 +12,41 @@ st.set_page_config(page_title="Pokémon Card Price Tracker", layout="wide")
 
 @st.cache_data(ttl=3600)
 def fetch_cards_from_scryfall(name):
-    url = f"https://api.scryfall.com/cards/search?q={name}"
+    """
+    Fetch Pokémon cards from Scryfall by name.
+    Works for exact and partial matches, e.g., 'charizard' or 'charizard gx'.
+    Handles pagination.
+    """
+    name = name.strip()
+    if not name:
+        return []
+
+    query = urllib.parse.quote(f'name:"{name}"')
+    url = f"https://api.scryfall.com/cards/search?q={query}"
+
     resp = requests.get(url)
     if resp.status_code != 200:
         return []
-    return resp.json().get("data", [])
 
-@st.cache_data(ttl=3600)
+    data = resp.json()
+    cards = data.get("data", [])
+
+    # Handle pagination
+    while data.get("has_more"):
+        next_page = data.get("next_page")
+        if not next_page:
+            break
+        resp = requests.get(next_page)
+        data = resp.json()
+        cards.extend(data.get("data", []))
+
+    return cards
+
+@st.cache_data(ttl=1800)
 def fetch_sold_prices_ebay(card_name, appid):
+    """
+    Fetch sold listings from eBay Completed Items API
+    """
     url = "https://svcs.ebay.com/services/search/FindingService/v1"
     params = {
         "OPERATION-NAME": "findCompletedItems",
@@ -39,6 +67,9 @@ def fetch_sold_prices_ebay(card_name, appid):
         return []
 
 def extract_prices_from_ebay(items, days):
+    """
+    Extract prices within the timescale
+    """
     prices = []
     cutoff = datetime.now() - timedelta(days=days)
     for it in items:
@@ -60,7 +91,6 @@ def timescale_to_days(timescale_str):
 # -------------------------------
 
 st.title("🎴 Pokémon Card Price Tracker")
-
 st.markdown("""
 Enter the name of a Pokémon card and see recent sold prices, along with images and stats.
 """)
@@ -90,7 +120,6 @@ if st.button("Search"):
             st.error("No cards found.")
         else:
             st.success(f"Found {len(cards)} cards.")
-
             days = timescale_to_days(timescale)
 
             # Display cards in 3-column grid
@@ -102,6 +131,7 @@ if st.button("Search"):
                     set_code = card.get("set", "")
                     number = card.get("collector_number", "")
 
+                    # Fetch eBay sold prices
                     items = fetch_sold_prices_ebay(f"{name} {set_code} {number}", EBAY_APP_ID)
                     prices = extract_prices_from_ebay(items, days)
 
@@ -124,6 +154,8 @@ if st.button("Search"):
                                 """, unsafe_allow_html=True)
                             else:
                                 st.image(img_url, width=200)
+
+                        # Card info
                         st.markdown(f"**{name} ({set_code}-{number})**")
                         if prices:
                             st.write(f"Lowest: ${lowest:.2f}")
