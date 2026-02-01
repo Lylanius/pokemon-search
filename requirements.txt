@@ -1,4 +1,6 @@
-streamlit
+gradio
 requests
+python-dotenv
 pandas
-altair
+numpy
+matplotlib
