@@ -1,12 +1,12 @@
-import os
-import base64
+# app.py
+import streamlit as st
 import requests
 import pandas as pd
-import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
-from datetime import datetime, timezone
-import streamlit as st
+from datetime import datetime
+import numpy as np
+import base64
 
 # --------------------------
 # CONFIG / SECRETS
@@ -16,21 +16,38 @@ EBAY_APP_ID     = st.secrets["EBAY_APP_ID"]
 EBAY_CERT_ID    = st.secrets["EBAY_CERT_ID"]
 DEFAULT_COMPS_LIMIT = 20
 
-API_ROOT = "https://www.pokemonpricetracker.com/api/v2"
-
 # --------------------------
-# API HELPERS
+# HELPERS
 # --------------------------
 def _auth_header():
     return {"Authorization": f"Bearer {POKEMON_API_KEY}"}
 
-def search_card(name: str, set_code: str = "", rarity: str = ""):
-    """Search Pokemon Price Tracker API with optional set and rarity filters"""
-    params = {"q": name}
-    if set_code:
-        params["set"] = set_code
-    if rarity:
-        params["rarity"] = rarity
+def parse_iso(dt_str):
+    if not dt_str:
+        return None
+    s = dt_str.replace("Z", "+00:00")
+    try:
+        return datetime.fromisoformat(s)
+    except:
+        return None
+
+def price_link(label, price):
+    try:
+        p = float(price)
+        return f"{label}: £{p:.2f}"
+    except:
+        return f"{label}: —"
+
+# --------------------------
+# POKEMON PRICE TRACKER API
+# --------------------------
+API_ROOT = "https://www.pokemonpricetracker.com/api/v2"
+
+def search_card(query: str):
+    """Search cards by name only (API does not like complex queries)."""
+    if not query.strip():
+        return []
+    params = {"q": query.strip()}
     r = requests.get(f"{API_ROOT}/cards", headers=_auth_header(), params=params, timeout=20)
     r.raise_for_status()
     payload = r.json()
@@ -51,7 +68,7 @@ def get_price_history(card_id: str, days: int = 30, limit: int = 20):
     return (data or [])[:limit]
 
 # --------------------------
-# eBay Live Listings
+# EBAY BROWSE API
 # --------------------------
 def get_ebay_token():
     url = "https://api.ebay.com/identity/v1/oauth2/token"
@@ -92,88 +109,77 @@ def get_ebay_live_listings(keywords: str, limit: int = 10, uk_only: bool = True)
     return items
 
 # --------------------------
-# UTILS
-# --------------------------
-def parse_iso(dt_str: str):
-    if not dt_str:
-        return None
-    s = dt_str.replace("Z", "+00:00")
-    try:
-        return datetime.fromisoformat(s)
-    except:
-        return None
-
-def fmt_date(dt_str: str):
-    try:
-        return parse_iso(dt_str).strftime("%d %b %Y")
-    except:
-        return str(dt_str)
-
-# --------------------------
 # STREAMLIT UI
 # --------------------------
-st.set_page_config(page_title="Poké-Quant Tracker", layout="wide")
+st.set_page_config(page_title="Poké‑Quant Master", layout="wide")
 
-st.title("Poké-Quant Tracker 🔥")
+st.title("Poké‑Quant Master 🔍")
 
 with st.sidebar:
-    st.header("Search Filters")
-    card_name = st.text_input("Card Name", "Charizard")
-    set_code  = st.text_input("Set Code (optional)", "")
-    rarity    = st.selectbox("Rarity (optional)", ["", "Common", "Uncommon", "Rare", "Ultra Rare", "Secret Rare"])
-    comps_limit = st.slider("Sold Comps Limit", 3, 50, DEFAULT_COMPS_LIMIT)
-    days_window = st.radio("Search Window (Days)", ["30", "60", "90"], index=2)
-    uk_only    = st.checkbox("UK Only (eBay)", True)
-    search_btn = st.button("Search Cards")
+    search_query = st.text_input("Card Name", value="Pikachu")
+    comps_limit  = st.slider("Number of Sold Comps", 3, 50, value=DEFAULT_COMPS_LIMIT)
+    days_window  = st.select_slider("Search Window (Days)", options=[30, 60, 90], value=90)
+    search_button = st.button("SEARCH CARD")
 
-if search_btn:
+if search_button:
     try:
-        # 1) Search card
-        cards = search_card(card_name.strip(), set_code.strip(), rarity)
+        cards = search_card(search_query)
         if not cards:
-            st.warning("No cards found. Try simplifying the search query (just card name).")
+            st.warning("No cards found. Try a simpler search (just the card name).")
         else:
-            # show first few card results
-            st.subheader("Results")
-            for c in cards[:10]:
-                st.image(c.get("image","https://via.placeholder.com/150"), width=120)
-                st.markdown(f"**{c.get('name','Unknown')}** - £{c.get('market_price',0):.2f}")
-                st.markdown(f"_Set: {c.get('set','')} | Rarity: {c.get('rarity','')}_")
-                card_id = c.get("id")
+            # Let user pick card
+            card_names = [c.get("name","Unknown") for c in cards]
+            selected_card = st.selectbox("Select Card", card_names)
+            card_idx = card_names.index(selected_card)
+            card_id = cards[card_idx].get("id")
+            
+            # Get card price + sold history
+            card_data = get_card_price(card_id)
+            sold_history = get_price_history(card_id, days=days_window, limit=comps_limit)
 
-                # 2) Sold history
-                history = get_price_history(card_id, days=int(days_window), limit=int(comps_limit))
-                if history:
-                    dates = [parse_iso(h.get("date") or h.get("sold_at") or h.get("timestamp")) for h in history]
-                    prices = [h.get("price") or h.get("sold_price") for h in history]
+            st.subheader("Card Info")
+            st.write(f"**Name:** {card_data.get('name')}")
+            st.write(price_link("Market Price", card_data.get("market_price")))
+            st.write(price_link("Low Price", card_data.get("low_price")))
+            st.write(price_link("High Price", card_data.get("high_price")))
 
-                    fig, ax = plt.subplots(figsize=(8,3.5))
-                    ax.scatter(dates, prices, color='#00ff00', s=40)
-                    if len(prices) > 1:
-                        x_nums = np.array([d.timestamp() for d in dates])
-                        y_vals = np.array(prices)
-                        x_norm = x_nums - x_nums.mean()
-                        coeffs = np.polyfit(x_norm, y_vals, 1)
-                        trend_y = np.polyval(coeffs, x_norm)
-                        ax.plot(dates, trend_y, color='#ffaa00', linestyle='--', linewidth=1.5)
-                    ax.set_title(f"Sold Prices: {c.get('name')}")
-                    ax.set_ylabel("Price (£)")
-                    ax.xaxis.set_major_formatter(mdates.DateFormatter('%d %b'))
-                    fig.autofmt_xdate()
-                    st.pyplot(fig)
-                else:
-                    st.info("No sold history available.")
+            if sold_history:
+                dates = [parse_iso(h.get("date") or h.get("sold_at") or h.get("timestamp")) for h in sold_history]
+                prices = [float(h.get("price") or h.get("sold_price") or 0) for h in sold_history]
 
-                # 3) Live eBay listings
-                live_items = get_ebay_live_listings(c.get("name"), limit=5, uk_only=uk_only)
-                if live_items:
-                    st.markdown("**Live eBay Listings:**")
-                    for li in live_items:
-                        st.markdown(f"- [{li['title']}]({li['url']}) - £{li['price']:.2f}")
-                else:
-                    st.info("No live eBay listings found.")
+                st.subheader("Sold History")
+                df = pd.DataFrame({"Date": [d.strftime("%Y-%m-%d") for d in dates], "Price (£)": prices})
+                st.dataframe(df)
 
-    except requests.HTTPError as e:
+                # Plot
+                fig, ax = plt.subplots(figsize=(8,4))
+                ax.scatter(dates, prices, color='green', label="Sold")
+                if len(prices) > 1:
+                    x_nums = np.array([d.timestamp() for d in dates])
+                    y_vals = np.array(prices)
+                    x_norm = x_nums - x_nums.mean()
+                    coeffs = np.polyfit(x_norm, y_vals, 1)
+                    trend_y = np.polyval(coeffs, x_norm)
+                    ax.plot(dates, trend_y, color='orange', linestyle='--', label="Trend")
+                ax.axhline(float(card_data.get("market_price") or 0), color='cyan', linestyle=':', label="Market")
+                ax.xaxis.set_major_formatter(mdates.DateFormatter('%d %b'))
+                fig.autofmt_xdate(rotation=30, ha='right')
+                ax.set_ylabel("Price (£)")
+                ax.legend()
+                st.pyplot(fig)
+            else:
+                st.info("No sold history available for this card.")
+
+            # Live eBay listings
+            st.subheader("Live eBay Listings")
+            live_items = get_ebay_live_listings(card_data.get("name"), limit=10)
+            if live_items:
+                for item in live_items:
+                    st.markdown(f"[{item['title']}]({item['url']}) - £{item['price']:.2f}")
+            else:
+                st.info("No live listings found.")
+
+    except requests.exceptions.HTTPError as e:
         st.error(f"API HTTP error: {e}")
     except Exception as e:
         st.error(f"Unexpected error: {e}")
