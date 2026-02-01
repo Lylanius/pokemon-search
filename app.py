@@ -6,158 +6,219 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 from datetime import datetime
+import urllib.parse
+import base64
 
 # --------------------------
-# Load secrets
+# CONFIG / SECRETS
 # --------------------------
-POKEMON_API_KEY = st.secrets.get("POKEMON_API_KEY", "")
-EBAY_APP_ID     = st.secrets.get("EBAY_APP_ID", "")
-EBAY_CERT_ID    = st.secrets.get("EBAY_CERT_ID", "")
-API_ROOT = "https://www.pokemonpricetracker.com/api/v2"
+POKEMON_API_KEY = st.secrets["POKEMON_API_KEY"]
+EBAY_APP_ID     = st.secrets["EBAY_APP_ID"]
+EBAY_CERT_ID    = st.secrets["EBAY_CERT_ID"]
 DEFAULT_COMPS_LIMIT = 20
+API_ROOT = "https://www.pokemonpricetracker.com/api/v2"
 
 # --------------------------
-# Helpers
+# HELPERS
 # --------------------------
-def auth_header():
-    if not POKEMON_API_KEY:
-        raise ValueError("Missing Pokémon API key — add to Streamlit Secrets")
-    return {"Authorization": f"Bearer {POKEMON_API_KEY}"}
-
-def parse_iso(dt_str):
+def parse_iso(dt_str: str) -> datetime:
     if not dt_str:
         return None
     s = dt_str.replace("Z", "+00:00")
     try:
         return datetime.fromisoformat(s)
-    except:
-        return None
+    except Exception:
+        return datetime.strptime(s, "%Y-%m-%dT%H:%M:%S%z")
 
-# --------------------------
-# API functions
-# --------------------------
-def safe_get(url, params=None):
-    """Make a GET request and return JSON or error."""
+def price_link(label, price):
     try:
-        response = requests.get(url, headers=auth_header(), params=params, timeout=15)
-        response.raise_for_status()
-        return response.json()
+        p = float(price)
+        return f"{label}: £{p:.2f}<br>"
+    except Exception:
+        return f"{label}: —<br>"
+
+def safe_get(url, params=None):
+    """Safe request with error handling."""
+    try:
+        r = requests.get(url, params=params, timeout=20,
+                         headers={"Authorization": f"Bearer {POKEMON_API_KEY}"})
+        r.raise_for_status()
+        return r.json()
     except requests.HTTPError as e:
-        st.error(f"🛑 API HTTP error: {e}")
-        return None
-    except Exception as e:
-        st.error(f"🛑 Request failed: {e}")
-        return None
-
-def search_cards(query):
-    return safe_get(f"{API_ROOT}/cards", params={"q": query}) or []
-
-def get_price_details(card_id):
-    return safe_get(f"{API_ROOT}/cards/{card_id}")
-
-def get_price_history(card_id, days, limit):
-    return safe_get(f"{API_ROOT}/cards/{card_id}/history", params={"days": days, "limit": limit}) or []
-
-# --------------------------
-# UI
-# --------------------------
-st.title("Poké‑Quant Price Tracker")
-
-# Sidebar controls
-with st.sidebar:
-    search_input = st.text_input("Search Card", value="Pikachu")
-    comps_limit  = st.slider("Sold Comps", 3, 50, DEFAULT_COMPS_LIMIT)
-    days_window  = st.radio("SEARCH WINDOW (DAYS)", [30,60,90], index=2)
-    search_button = st.button("Search")
-
-if search_button:
-    if not search_input.strip():
-        st.warning("Please enter a card name to search.")
-    else:
-        cards_data = search_cards(search_input.strip())
-        
-        # If the API returned a dict with cards inside
-        cards = cards_data.get("cards") or cards_data.get("data") if isinstance(cards_data, dict) else cards_data
-
-        if not cards:
-            st.info("No cards found with that query.")
+        if e.response.status_code == 400:
+            st.warning("Search query too complex or invalid. Try simplifying it (e.g., just the card name).")
         else:
-            # Show search results
-            st.subheader("Search Results")
-            for card in cards[:8]:
-                st.image(card.get("image",""), width=120, caption=card.get("name",""))
+            st.error(f"API error: {e}")
+        return []
+    except Exception as e:
+        st.error(f"Unexpected error: {e}")
+        return []
 
-            selected = cards[0]  # default to first result
-            card_id = selected.get("id")
+# --------------------------
+# POKEMON PRICE TRACKER API
+# --------------------------
+def search_card(query: str):
+    if not query.strip():
+        return []
+    q = urllib.parse.quote(query.strip())
+    payload = safe_get(f"{API_ROOT}/cards", params={"q": q})
+    cards = payload.get("cards") or payload.get("data") or []
 
-            # Price overview
-            price_info = get_price_details(card_id)
-            if price_info:
-                st.markdown(f"### {price_info.get('name','Unknown')}")
-                st.write(f"**Market**: £{price_info.get('market_price',0):.2f}")
-                st.write(f"**Low**: £{price_info.get('low_price',0):.2f}")
-                st.write(f"**High**: £{price_info.get('high_price',0):.2f}")
+    # fallback: simplify query if nothing returned
+    if not cards:
+        simplified = query.strip().split()[0]
+        q_simple = urllib.parse.quote(simplified)
+        payload = safe_get(f"{API_ROOT}/cards", params={"q": q_simple})
+        cards = payload.get("cards") or payload.get("data") or []
 
-            # Sold history
-            history = get_price_history(card_id, days_window, comps_limit)
-            if history:
-                dates, prices = [], []
-                for h in history:
-                    dt = parse_iso(h.get("date"))
-                    pr = h.get("price")
-                    if dt and pr is not None:
-                        dates.append(dt)
-                        prices.append(pr)
+    return cards
 
-                if dates:
-                    st.subheader("Sold Price History")
-                    df = pd.DataFrame({"Date": dates, "Price (£)": prices})
-                    st.dataframe(df.sort_values("Date", ascending=False))
+def get_card_price(card_id: str):
+    payload = safe_get(f"{API_ROOT}/cards/{card_id}")
+    return payload or {}
 
-                    fig, ax = plt.subplots(figsize=(7,3))
-                    ax.scatter(dates, prices, color="blue")
-                    ax.xaxis.set_major_formatter(mdates.DateFormatter('%d %b'))
-                    st.pyplot(fig)
-            else:
-                st.info("No sold history available.")
+def get_price_history(card_id: str, days: int = 30, limit: int = 20):
+    payload = safe_get(f"{API_ROOT}/cards/{card_id}/history", params={"days": days, "limit": limit})
+    if isinstance(payload, dict) and "history" in payload:
+        payload = payload["history"]
+    return (payload or [])[:limit]
 
-            # Live eBay (optional)
-            if EBAY_APP_ID and EBAY_CERT_ID:
-                import base64
-                def get_ebay_token():
-                    url = "https://api.ebay.com/identity/v1/oauth2/token"
-                    encoded = base64.b64encode(f"{EBAY_APP_ID}:{EBAY_CERT_ID}".encode()).decode()
-                    headers = {"Content-Type":"application/x-www-form-urlencoded",
-                               "Authorization": f"Basic {encoded}"}
-                    data={"grant_type":"client_credentials","scope":"https://api.ebay.com/oauth/api_scope"}
-                    try:
-                        r = requests.post(url, headers=headers, data=data, timeout=10)
-                        r.raise_for_status()
-                        return r.json().get("access_token")
-                    except:
-                        return None
+# --------------------------
+# eBay Browse API (LIVE listings)
+# --------------------------
+def get_ebay_token():
+    """Client credentials token"""
+    url = "https://api.ebay.com/identity/v1/oauth2/token"
+    encoded = base64.b64encode(f"{EBAY_APP_ID}:{EBAY_CERT_ID}".encode()).decode()
+    headers = {"Content-Type": "application/x-www-form-urlencoded",
+               "Authorization": f"Basic {encoded}"}
+    data = {"grant_type": "client_credentials",
+            "scope": "https://api.ebay.com/oauth/api_scope"}
+    try:
+        r = requests.post(url, headers=headers, data=data, timeout=20)
+        r.raise_for_status()
+        return r.json().get("access_token")
+    except Exception as e:
+        st.error(f"eBay auth error: {e}")
+        return None
 
-                token = get_ebay_token()
-                if token:
-                    ebay_listings = []
-                    try:
-                        headers = {"Authorization": f"Bearer {token}", "X-EBAY-C-MARKETPLACE-ID":"EBAY_GB"}
-                        r = requests.get("https://api.ebay.com/buy/browse/v1/item_summary/search",
-                                         headers=headers, params={"q": price_info.get("name",""), "limit":10}, timeout=15)
-                        r.raise_for_status()
-                        for item in r.json().get("itemSummaries", []):
-                            price_val = item.get("price", {}).get("value")
-                            if price_val:
-                                ebay_listings.append((item.get("title",""), price_val, item.get("itemWebUrl","")))
-                    except:
-                        pass
+def get_ebay_live_listings(keywords: str, limit: int = 10, uk_only: bool = True):
+    token = get_ebay_token()
+    if not token:
+        return []
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "X-EBAY-C-MARKETPLACE-ID": "EBAY_GB" if uk_only else "EBAY_US"
+    }
+    params = {"q": keywords, "limit": limit}
+    if uk_only:
+        params["filter"] = "itemLocationCountry:GB"
+    try:
+        r = requests.get("https://api.ebay.com/buy/browse/v1/item_summary/search",
+                         headers=headers, params=params, timeout=20)
+        r.raise_for_status()
+        items = []
+        for i in r.json().get("itemSummaries", []):
+            try:
+                price = float(i["price"]["value"])
+            except Exception:
+                continue
+            items.append({
+                "title": i.get("title",""),
+                "price": price,
+                "url":   i.get("itemWebUrl") or i.get("itemAffiliateWebUrl","")
+            })
+        return items
+    except Exception as e:
+        st.error(f"eBay search error: {e}")
+        return []
 
-                    if ebay_listings:
-                        st.subheader("eBay Live Listings")
-                        for t,v,url in ebay_listings:
-                            st.markdown(f"[{t}]({url}) — £{v}")
-                    else:
-                        st.info("No eBay listings found.")
-                else:
-                    st.warning("Could not authenticate with eBay.")
+# --------------------------
+# SHOW CARD DATA
+# --------------------------
+def show_card_data(card_id: str, comps_limit: int, days: int):
+    card_price = get_card_price(card_id)
+    name         = card_price.get("name","Unknown")
+    market_price = card_price.get("market_price",0)
+    low_price    = card_price.get("low_price",0)
+    high_price   = card_price.get("high_price",0)
 
+    history = get_price_history(card_id, days=int(days), limit=int(comps_limit)) or []
+    dates, prices = [], []
+    for h in history:
+        dt = parse_iso(h.get("date") or h.get("sold_at") or h.get("timestamp"))
+        pr = h.get("price") or h.get("sold_price")
+        if dt and pr is not None:
+            dates.append(dt)
+            prices.append(float(pr))
+
+    # Sold HTML
+    sold_html = (
+        "<div>"
+        + price_link("MARKET", market_price)
+        + price_link("LOW", low_price)
+        + price_link("HIGH", high_price)
+        + f"VOLUME: {len(prices)}</div>"
+    )
+
+    # Plot
+    sold_plot = None
+    if dates:
+        fig, ax = plt.subplots(figsize=(7,3.5))
+        ax.scatter(dates, prices, color='green', s=40, label="Sold")
+        if len(prices) > 1:
+            x_nums = np.array([d.timestamp() for d in dates])
+            y_vals = np.array(prices)
+            x_norm = x_nums - x_nums.mean()
+            coeffs = np.polyfit(x_norm, y_vals, 1)
+            trend_y = np.polyval(coeffs, x_norm)
+            ax.plot(dates, trend_y, color='orange', linestyle='--', linewidth=1.5, label="Trend")
+        ax.axhline(float(market_price or 0), color='cyan', linestyle=':', linewidth=1, label=f"Market £{float(market_price or 0):.0f}")
+        ax.xaxis.set_major_formatter(mdates.DateFormatter('%d %b'))
+        fig.autofmt_xdate(rotation=30, ha='right')
+        ax.set_ylabel("Price (£)")
+        ax.legend()
+        ax.set_title(f"Sold Prices: {name}")
+        plt.tight_layout()
+        sold_plot = fig
+
+    sold_df = pd.DataFrame(
+        [{"Price": p, "Date": d.strftime("%Y-%m-%d")} for p, d in sorted(zip(prices, dates), key=lambda t: t[1], reverse=True)]
+    )
+
+    # Live eBay listings
+    live_items = get_ebay_live_listings(name, limit=10)
+    live_html = "<div>"
+    if live_items:
+        for li in live_items:
+            live_html += f"<a href='{li['url']}' target='_blank'>{li['title']}</a> - £{li['price']:.2f}<br>"
+    else:
+        live_html += "No live listings found"
+    live_html += "</div>"
+
+    return sold_html, sold_plot, sold_df, live_html
+
+# --------------------------
+# STREAMLIT UI
+# --------------------------
+st.title("Pokémon Price Tracker")
+
+search_query = st.text_input("Search Pokémon card", "Pikachu")
+comps_limit   = st.slider("Sold comps", 3, 50, DEFAULT_COMPS_LIMIT)
+days_window   = st.radio("Search window (days)", ["30","60","90"], index=2)
+
+if st.button("Search"):
+    cards = search_card(search_query.strip())
+    if not cards:
+        st.warning("No cards found for that search.")
+    else:
+        selected = st.selectbox("Select card", [f"{c.get('name')} ({c.get('set_code')})" for c in cards])
+        idx = [f"{c.get('name')} ({c.get('set_code')})" for c in cards].index(selected)
+        card_id = cards[idx].get("id")
+        sold_html, sold_plot, sold_df, live_html = show_card_data(card_id, comps_limit, int(days_window))
+        
+        st.markdown(sold_html, unsafe_allow_html=True)
+        if sold_plot:
+            st.pyplot(sold_plot)
+        st.dataframe(sold_df)
+        st.markdown(live_html, unsafe_allow_html=True)
