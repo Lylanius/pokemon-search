@@ -11,7 +11,6 @@ st.set_page_config(page_title="Pokémon Card Price Tracker", layout="wide")
 
 @st.cache_data(ttl=3600)
 def fetch_cards_from_scryfall(name):
-    """Fetch card data from Scryfall"""
     url = f"https://api.scryfall.com/cards/search?q={name}"
     resp = requests.get(url)
     if resp.status_code != 200:
@@ -20,7 +19,6 @@ def fetch_cards_from_scryfall(name):
 
 @st.cache_data(ttl=3600)
 def fetch_sold_prices_ebay(card_name, appid):
-    """Fetch sold listings from eBay Completed Items API"""
     url = "https://svcs.ebay.com/services/search/FindingService/v1"
     params = {
         "OPERATION-NAME": "findCompletedItems",
@@ -41,7 +39,6 @@ def fetch_sold_prices_ebay(card_name, appid):
         return []
 
 def extract_prices_from_ebay(items, days):
-    """Extract prices within timescale"""
     prices = []
     cutoff = datetime.now() - timedelta(days=days)
     for it in items:
@@ -74,6 +71,13 @@ with col1:
 with col2:
     timescale = st.selectbox("Recent sales timescale:", ["7 Days", "30 Days", "90 Days", "365 Days"])
 
+# ✅ Load eBay App ID from Streamlit secrets
+try:
+    EBAY_APP_ID = st.secrets["ebay"]["app_id"]
+except KeyError:
+    st.error("eBay App ID not found in secrets! Please add it in Streamlit Cloud settings.")
+    st.stop()
+
 if st.button("Search"):
     if not card_query:
         st.error("Please enter a card name.")
@@ -87,8 +91,6 @@ if st.button("Search"):
         else:
             st.success(f"Found {len(cards)} cards.")
 
-            # -- 2) eBay API
-            EBAY_APP_ID = "YOUR_EBAY_APP_ID"  # <-- Replace with your eBay App ID
             days = timescale_to_days(timescale)
 
             # Display cards in 3-column grid
