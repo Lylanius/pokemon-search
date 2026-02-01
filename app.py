@@ -1,11 +1,12 @@
 import math
-import time
 import html
 from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 import requests
 import streamlit as st
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # ------------------------------------------------------------
 # Page setup
@@ -21,19 +22,55 @@ EBAY_APP_ID = (
     or st.secrets.get("EBAY_APPID")
 )
 
-# Optional but recommended to avoid low limits
+# Optional, but recommended (better rate limits)
 POKEMONTCG_API_KEY = st.secrets.get("POKEMONTCG_API_KEY", None)
 
-POKEMONTCG_ENDPOINT = "https://api.pokemontcg.io/v2/cards"
+# Primary endpoints
+POKEMONTCG_ENDPOINT = "https://api.pokemontcg.io/v2/cards"  # Search cards endpoint [10](https://www.pokemonpricetracker.com/docs)
 FINDING_ENDPOINT = "https://svcs.ebay.com/services/search/FindingService/v1"
 
-# Default to UK. You can switch to EBAY-US etc.
+# Fallback provider (TCGdex)
+TCGDEX_LIST_ENDPOINT = "https://api.tcgdex.net/v2/en/cards"
+TCGDEX_CARD_ENDPOINT = "https://api.tcgdex.net/v2/en/cards/{card_id}"  # Single card [5](https://tcgdex.dev/es/rest/card)
+
+# Default to UK eBay site; change if needed
 EBAY_GLOBAL_ID = "EBAY-GB"
 
 
 # ------------------------------------------------------------
-# Utilities
+# HTTP session with retries/backoff (robust against timeouts)
 # ------------------------------------------------------------
+@st.cache_resource
+def http_session():
+    """
+    Create a shared requests.Session with retries + backoff.
+    Retries help transient issues like timeouts or 5xx. [3](https://www.slingacademy.com/article/resolving-timeout-exceptions-python-requests/)[2](https://www.geeksforgeeks.org/python/python-requests-readtimeout-error/)
+    """
+    session = requests.Session()
+
+    retry = Retry(
+        total=4,
+        connect=4,
+        read=4,
+        backoff_factor=0.7,  # exponential-ish delays between retries
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=("GET",),
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=20, pool_maxsize=20)
+
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
+
+def safe_snippet(text, n=800):
+    if text is None:
+        return ""
+    text = str(text)
+    return text[:n] + ("…" if len(text) > n else "")
+
+
 def money_fmt(value, currency="GBP"):
     if value is None:
         return "—"
@@ -45,38 +82,15 @@ def money_fmt(value, currency="GBP"):
     return f"{currency} {value:,.2f}"
 
 
-def safe_snippet(text, n=800):
-    if text is None:
-        return ""
-    text = str(text)
-    return text[:n] + ("…" if len(text) > n else "")
-
-
-def pick_tcgplayer_market(card: dict):
-    """
-    Returns (market_price, finish_name) if available in the Pokémon TCG API payload.
-    """
-    tcg = card.get("tcgplayer") or {}
-    prices = tcg.get("prices") or {}
-    for finish, pdata in prices.items():
-        if isinstance(pdata, dict) and pdata.get("market") is not None:
-            return float(pdata["market"]), finish
-    return None, None
-
-
 def card_tile_html(image_url: str, name: str, subtitle: str, badge_text: str):
-    """
-    Creates a tile similar to pokemonpricetracker style:
-    - image
-    - badge overlay top-right
-    - name & subtitle below
-    """
     safe_name = html.escape(name or "")
     safe_sub = html.escape(subtitle or "")
     safe_badge = html.escape(badge_text or "")
 
-    img_tag = f'<img src="{html.escape(image_url)}" style="width:100%; display:block;">' if image_url else \
-              '<div style="height: 310px; display:flex; align-items:center; justify-content:center; color:#aaa;">No image</div>'
+    if image_url:
+        img_html = f'<img src="{html.escape(image_url)}" style="width:100%; display:block;" />'
+    else:
+        img_html = '<div style="height:310px; display:flex; align-items:center; justify-content:center; color:#aaa;">No image</div>'
 
     return f"""
     <div style="width: 100%; max-width: 220px; margin: 0 auto;">
@@ -88,7 +102,7 @@ def card_tile_html(image_url: str, name: str, subtitle: str, badge_text: str):
         box-shadow: 0 6px 18px rgba(0,0,0,0.25);
         background: #111;
       ">
-        {img_tag}
+        {img_html}
         <div style="
           position: absolute;
           top: 10px;
@@ -111,47 +125,69 @@ def card_tile_html(image_url: str, name: str, subtitle: str, badge_text: str):
 
 
 # ------------------------------------------------------------
-# Pokémon TCG API (safe call + caching)
+# PokémonTCG helpers (primary)
 # ------------------------------------------------------------
-@st.cache_data(ttl=60 * 30)  # 30 minutes
-def pokemontcg_search_cards(query: str, page_size: int = 24):
+def pick_pokemontcg_market(card: dict):
     """
-    Safe wrapper around Pokémon TCG API.
-    Returns dict: {ok, status, error, details, data}
+    PokémonTCG card responses can include tcgplayerapi-reference/cards/get-card/)[12](https://developer.ebay.com/support/kb-article?KBid=1456)
     """
-    headers = {
-        "Accept": "application/json",
-        "User-Agent": "pokemon-search/1.0",
-    }
-    if POKEMONTCG_API_KEY:
-        headers["X-Api-Key"] = POKEMONTCG_API_KEY
+    tcg = card.get("tcgplayer") or {}
+    prices = tcg.get("prices") or {}
+    for finish, pdata in prices.items():
+        if isinstance(pdata, dict) and pdata.get("market") is not None:
+            return float(pdata["market"]), finish
+    return None, None
 
-    # Lucene-like query syntax, e.g. name:"charizard"
+
+def normalize_from_pokemontcg(card: dict):
+    set_obj = card.get("set") or {}
+    images = card.get("images") or {}
+    market, _finish = pick_pokemontcg_market(card)
+
+    return {
+        "source": "pokemontcg",
+        "id": card.get("id"),
+        "name": card.get("name", "Unknown"),
+        "number": card.get("number", "?"),
+        "set_name": set_obj.get("name", "Unknown set"),
+        "image_small": images.get("small"),
+        "image_large": images.get("large"),
+        "market_price": market,
+        "raw": card,
+    }
+
+
+@st.cache_data(ttl=60 * 30)
+def pokemontcg_search_cards(query: str, page_size: int, timeout=(5, 60)):
+    """
+    Safe search for cards via PokémonTCG API (Lucene-like q syntax). [10](https://www.pokemonpricetracker.com/docs)
+    Adds larger read timeout + retries via session. [1](https://pytutorial.com/python-requests-timeout-master-response-time-control/)[3](https://www.slingacademy.com/article/resolving-timeout-exceptions-python-requests/)
+    """
+    s = http_session()
+    headers = {"Accept": "application/json", "User-Agent": "pokemon-search/1.0"}
+    if POKEMONTCG_API_KEY:
+        headers["X-Api-Key"] = POKEMONTCG_API_KEY  # Auth via X-Api-Key [6](https://developer.ebay.com/api-docs/buy/marketplace_insights/resources/methods)
+
     params = {
         "q": f'name:"{query}"',
         "page": 1,
         "pageSize": page_size,
-        # Keep payload smaller; if you run into 400s, remove 'select' temporarily.
         "select": "id,name,number,set,images,rarity,tcgplayer",
         "orderBy": "set.releaseDate",
     }
 
     try:
-        r = requests.get(POKEMONTCG_ENDPOINT, headers=headers, params=params, timeout=30)
+        r = s.get(POKEMONTCG_ENDPOINT, headers=headers, params=params, timeout=timeout)
+    except requests.exceptions.ReadTimeout as e:
+        return {"ok": False, "status": None, "error": "PokémonTCG API read timeout", "details": str(e), "data": []}
     except Exception as e:
-        return {
-            "ok": False,
-            "status": None,
-            "error": "Network error calling Pokémon TCG API",
-            "details": str(e),
-            "data": [],
-        }
+        return {"ok": False, "status": None, "error": "Network error calling PokémonTCG API", "details": str(e), "data": []}
 
     if r.status_code == 429:
         return {
             "ok": False,
             "status": 429,
-            "error": "Pokémon TCG API rate limit hit (HTTP 429).",
+            "error": "PokémonTCG API rate limit hit (HTTP 429).",
             "details": safe_snippet(r.text, 800),
             "data": [],
         }
@@ -160,50 +196,112 @@ def pokemontcg_search_cards(query: str, page_size: int = 24):
         return {
             "ok": False,
             "status": r.status_code,
-            "error": f"Pokémon TCG API error (HTTP {r.status_code}).",
+            "error": f"PokémonTCG API error (HTTP {r.status_code}).",
             "details": safe_snippet(r.text, 800),
             "data": [],
         }
 
-    try:
-        payload = r.json()
-    except Exception as e:
-        return {
-            "ok": False,
-            "status": r.status_code,
-            "error": "Failed to parse Pokémon TCG API JSON response.",
-            "details": str(e),
-            "data": [],
-        }
-
+    payload = r.json()
     return {"ok": True, "status": 200, "error": None, "details": None, "data": payload.get("data", [])}
 
 
 # ------------------------------------------------------------
-# eBay Finding API (sold listings) - may be restricted
+# TCGdex helpers (fallback)
 # ------------------------------------------------------------
-def build_ebay_keywords(card: dict):
+def normalize_from_tcgdex(card: dict):
     """
-    Basic keyword builder. You will refine this over time for better matching.
+    TCGdex single-card responses include set name + localId + image. [5](https://tcgdex.dev/es/rest/card)[13](https://tcgdex.dev/reference/card)
     """
-    name = (card.get("name") or "").strip()
-    number = (card.get("number") or "").strip()
-    set_name = ((card.get("set") or {}).get("name") or "").strip()
+    set_obj = card.get("set") or {}
+    pricing = card.get("pricing") or {}
+    market = None
+
+    # pricing fields exist but may vary by provider. [13](https://tcgdex.dev/reference/card)
+    tcgplayer = pricing.get("tcgplayer") or {}
+    # Best-effort read (API providers differ in structure)
+    if isinstance(tcgplayer, dict):
+        # Try common patterns:
+        for k in ("normal", "holofoil", "reverse-holofoil", "unlimited", "1st-edition"):
+            if isinstance(tcgplayer.get(k), dict) and tcgplayer[k].get("market") is not None:
+                market = float(tcgplayer[k]["market"])
+                break
+
+    return {
+        "source": "tcgdex",
+        "id": card.get("id"),
+        "name": card.get("name", "Unknown"),
+        "number": card.get("localId", "?"),
+        "set_name": set_obj.get("name", "Unknown set"),
+        "image_small": card.get("image"),
+        "image_large": card.get("image"),
+        "market_price": market,
+        "raw": card,
+    }
+
+
+@st.cache_data(ttl=60 * 30)
+def tcgdex_search_cards(query: str, page_size: int, timeout=(5, 60)):
+    """
+    Search TCGdex using query filters like ?name=pikachu (lax contains) or ?name=eq:Pikachu (exact). [4](https://tcgdex.dev/rest/filtering-sorting-pagination)[14](https://tcgdex.dev/rest/cards)
+    We use lax matching to behave like a normal search.
+    """
+    s = http_session()
+    params = {
+        "name": query,  # lax contains search by default [4](https://tcgdex.dev/rest/filtering-sorting-pagination)
+    }
+    try:
+        r = s.get(TCGDEX_LIST_ENDPOINT, params=params, timeout=timeout)
+    except requests.exceptions.ReadTimeout as e:
+        return {"ok": False, "status": None, "error": "TCGdex API read timeout", "details": str(e), "data": []}
+    except Exception as e:
+        return {"ok": False, "status": None, "error": "Network error calling TCGdex API", "details": str(e), "data": []}
+
+    if r.status_code >= 400:
+        return {
+            "ok": False,
+            "status": r.status_code,
+            "error": f"TCGdex API error (HTTP {r.status_code}).",
+            "details": safe_snippet(r.text, 800),
+            "data": [],
+        }
+
+    # list endpoint returns array of CardBrief
+    data = r.json()
+    return {"ok": True, "status": 200, "error": None, "details": None, "data": data[:page_size]}
+
+
+@st.cache_data(ttl=60 * 60)
+def tcgdex_get_card(card_id: str, timeout=(5, 60)):
+    """
+    Fetch full card object (includes set name) from TCGdex. [5](https://tcgdex.dev/es/rest/card)[13](https://tcgdex.dev/reference/card)
+    """
+    s = http_session()
+    url = TCGDEX_CARD_ENDPOINT.format(card_id=card_id)
+    r = s.get(url, timeout=timeout)
+    if r.status_code >= 400:
+        return None
+    return r.json()
+
+
+# ------------------------------------------------------------
+# eBay sold listings (may be restricted)
+# ------------------------------------------------------------
+def build_ebay_keywords(norm_card: dict):
+    """
+    Build keywords using name + set + number. (Heuristic)
+    """
+    name = (norm_card.get("name") or "").strip()
+    number = (norm_card.get("number") or "").strip()
+    set_name = (norm_card.get("set_name") or "").strip()
 
     excluded = "-lot -bundle -collection -proxy -digital -code"
-
-    # Use "name" + "set" + "number" to reduce noise
-    # (Many sets reuse numbers; this isn't perfect.)
-    kw = f'"{name}" "{set_name}" "{number}" pokemon card {excluded}'
-    return kw
+    return f'"{name}" "{set_name}" "{number}" pokemon card {excluded}'
 
 
-@st.cache_data(ttl=60 * 20)  # 20 minutes
+@st.cache_data(ttl=60 * 20)
 def ebay_find_completed_items(keywords: str, days: int = 30, entries: int = 50, include_shipping: bool = True):
     """
-    Attempts to use eBay Finding API findCompletedItems.
-    NOTE: Many developers are blocked/restricted for completed-items access.
-    Returns {ok, error, items}
+    Attempts eBay Finding API findCompletedItems (often restricted for many apps). [9](https://publicapis.io/pokemon-tcg-api)[8](https://api.pokemontcg.io/v2/cards?page=1&pageSize=100)
     """
     if not EBAY_APP_ID:
         return {"ok": False, "error": "Missing EBAY_APP_ID in Streamlit secrets.", "items": []}
@@ -230,8 +328,7 @@ def ebay_find_completed_items(keywords: str, days: int = 30, entries: int = 50, 
     }
 
     try:
-        r = requests.get(FINDING_ENDPOINT, params=params, timeout=30)
-        # Do NOT raise_for_status; we want to show a clean error.
+        r = requests.get(FINDING_ENDPOINT, params=params, timeout=(5, 30))
         payload = r.json()
     except Exception as e:
         return {"ok": False, "error": f"Error calling eBay Finding API: {e}", "items": []}
@@ -242,7 +339,6 @@ def ebay_find_completed_items(keywords: str, days: int = 30, entries: int = 50, 
 
     ack = (resp[0].get("ack") or [""])[0]
     if ack != "Success":
-        # Often Security / restricted
         return {"ok": False, "error": f"eBay ack={ack}: {safe_snippet(resp[0].get('errorMessage', {}), 600)}", "items": []}
 
     search_result = resp[0].get("searchResult", [{}])[0]
@@ -256,8 +352,6 @@ def ebay_find_completed_items(keywords: str, days: int = 30, entries: int = 50, 
 
         selling_status = (it.get("sellingStatus") or [{}])[0]
         price_obj = (selling_status.get("currentPrice") or [{}])[0]
-
-        # In JSON, value may appear under "__value__" or "#text"
         raw_price = price_obj.get("__value__", price_obj.get("#text", 0.0))
         try:
             price = float(raw_price or 0.0)
@@ -291,7 +385,6 @@ def ebay_find_completed_items(keywords: str, days: int = 30, entries: int = 50, 
             }
         )
 
-    # Filter to most common currency for stats sanity
     if normalized:
         cur = pd.Series([x["currency"] for x in normalized]).mode().iloc[0]
         normalized = [x for x in normalized if x["currency"] == cur]
@@ -322,24 +415,24 @@ st.title("Pokémon Card Sold Prices (Grid + Stats)")
 with st.expander("ℹ️ Notes about data sources", expanded=False):
     st.markdown(
         """
-- Pokémon card images + set/number come from the Pokémon TCG API. Searching uses the API's Lucene-style `q` parameter (e.g. `name:"Charizard"`).  
-- If you **don’t use an API key**, Pokémon TCG API limits are lower (e.g. 30/min and 1000/day), so you should use the **Search** button to avoid calling on every keystroke.  
-- eBay **sold-history** is attempted via `findCompletedItems`, but eBay restricted completed-item API access for many developers and moved this capability behind Marketplace Insights access.
-"""
+- **Primary card data**: Pokémon TCG API (`/v2/cards`) using Lucene-like `q` searches (e.g. `name:"Charizard"`). [10](https://www.pokemonpricetracker.com/docs)[11](https://docs.pokemontcg.io/api-reference/cards/get-card/)  
+- **Auth**: Pokémon TCG API supports `X-Api-Key` to raise rate limits; unauthenticated usage has much lower limits. [6](https://developer.ebay.com/api-docs/buy/marketplace_insights/resources/methods)[7](https://developer.ebay.com/devzone//finding/callref/extra/fnditmsadvncd.rqst.tmfltr.nm.html)  
+- **Fallback card data**: TCGdex (`/v2/en/cards`) with query filtering like `?name=pikachu` and `eq:` for exact matches. [4](https://tcgdex.dev/rest/filtering-sorting-pagination)[5](https://tcgdex.dev/es/rest/card)  
+- **eBay sold data**: attempts `findCompletedItems`, but eBay completed item APIs are often restricted and sold-history moved behind Marketplace Insights for many developers. [8](https://api.pokemontcg.io/v2/cards?page=1&pageSize=100)[9](https://publicapis.io/pokemon-tcg-api)  
+        """
     )
 
-
-# Sidebar controls
 st.sidebar.header("Filters")
 days = st.sidebar.select_slider("Timescale (days)", options=[7, 14, 30, 60, 90], value=30)
 include_shipping = st.sidebar.toggle("Include shipping in price", value=True)
 max_cards = st.sidebar.slider("Max card variants to show", 6, 36, 18, step=6)
 max_sales = st.sidebar.slider("Max sold listings per card (eBay)", 10, 100, 40, step=10)
-
-# Optional: avoid slow grid by allowing user to toggle eBay lookups
 do_ebay = st.sidebar.toggle("Fetch eBay sold data (may be restricted)", value=True)
 
-# Search form (prevents API call on each keystroke)
+connect_timeout = st.sidebar.slider("API connect timeout (sec)", 2, 20, 5)
+read_timeout = st.sidebar.slider("API read timeout (sec)", 10, 120, 60)
+timeout_tuple = (connect_timeout, read_timeout)
+
 with st.form("search_form"):
     query = st.text_input("Search for a card (e.g., Charizard, Umbreon VMAX)", value="Charizard")
     submitted = st.form_submit_button("Search")
@@ -347,49 +440,67 @@ with st.form("search_form"):
 if not submitted:
     st.stop()
 
-# Call Pokémon TCG API safely
-with st.spinner("Searching Pokémon card database…"):
-    result = pokemontcg_search_cards(query.strip(), page_size=max_cards)
-
-if not result["ok"]:
-    st.error(result["error"])
-    st.code(f"HTTP: {result['status']}\n{result['details']}", language="text")
-
-    if result["status"] == 429:
-        st.info(
-            "You hit the Pokémon TCG API rate limit. Add `POKEMONTCG_API_KEY` in Streamlit secrets "
-            "or wait a minute and try again. Using the Search button reduces calls."
-        )
-    elif result["status"] in (401, 403):
-        st.info(
-            "This looks like an authentication/permission issue. "
-            "Add `POKEMONTCG_API_KEY` to your Streamlit secrets to authenticate via `X-Api-Key`."
-        )
+query = query.strip()
+if not query:
+    st.warning("Enter a search term.")
     st.stop()
 
-cards = result["data"]
-if not cards:
+# 1) Try PokémonTCG first
+with st.spinner("Searching Pokémon card database…"):
+    primary = pokemontcg_search_cards(query, page_size=max_cards, timeout=timeout_tuple)
+
+normalized_cards = []
+provider_used = None
+
+if primary["ok"]:
+    provider_used = "PokémonTCG"
+    normalized_cards = [normalize_from_pokemontcg(c) for c in primary["data"]]
+else:
+    # 2) Fallback to TCGdex
+    with st.spinner("PokémonTCG unavailable — falling back to TCGdex…"):
+        fallback = tcgdex_search_cards(query, page_size=max_cards, timeout=timeout_tuple)
+
+    if fallback["ok"] and fallback["data"]:
+        provider_used = "TCGdex"
+        # Convert CardBrief -> full Card (to get set name)
+        full_cards = []
+        for brief in fallback["data"]:
+            cid = brief.get("id")
+            full = tcgdex_get_card(cid, timeout=timeout_tuple)
+            if full:
+                full_cards.append(full)
+        normalized_cards = [normalize_from_tcgdex(c) for c in full_cards]
+    else:
+        st.error("Both PokémonTCG and TCGdex look unavailable right now.")
+        st.markdown("### PokémonTCG error")
+        st.code(f"HTTP: {primary.get('status')}\n{primary.get('details')}", language="text")
+        st.markdown("### TCGdex error")
+        st.code(f"HTTP: {fallback.get('status') if 'fallback' in locals() else None}\n{fallback.get('details') if 'fallback' in locals() else ''}", language="text")
+        st.info(
+            "If this keeps happening, try increasing the read timeout (left sidebar) or adding a PokémonTCG API key "
+            "to reduce rate limiting. PokémonTCG rate limits are much lower without an API key. [7](https://developer.ebay.com/devzone//finding/callref/extra/fnditmsadvncd.rqst.tmfltr.nm.html)[6](https://developer.ebay.com/api-docs/buy/marketplace_insights/resources/methods)"
+        )
+        st.stop()
+
+if not normalized_cards:
     st.warning("No cards found. Try a different query.")
     st.stop()
 
-st.caption(
-    "Grid shows printings across sets. Badge shows eBay HIGH (if available) or TCGplayer market fallback."
-)
+st.caption(f"Card data provider used: **{provider_used}**")
 
 # Grid
 cols_per_row = 6
 cols = st.columns(cols_per_row)
 
-# Keep a list of cards for detail view selection
 card_labels = []
 card_map = {}
 
-for idx, card in enumerate(cards):
-    name = card.get("name", "Unknown")
-    number = card.get("number", "?")
-    set_name = (card.get("set") or {}).get("name", "Unknown set")
+for idx, card in enumerate(normalized_cards):
+    name = card["name"]
+    number = card["number"]
+    set_name = card["set_name"]
     subtitle = f"{number} • {set_name}"
-    img = (card.get("images") or {}).get("small") or (card.get("images") or {}).get("large")
+    img = card["image_small"] or card["image_large"]
 
     badge_text = "—"
     ebay_summary = None
@@ -412,33 +523,28 @@ for idx, card in enumerate(cards):
                 badge_text = "No sold data"
         else:
             ebay_error = ebay["error"]
-            # fallback to tcgplayer market
-            market, finish = pick_tcgplayer_market(card)
-            if market is not None:
-                badge_text = f"TCG Mkt {market:.2f}"
+            # fallback badge: market price if we have it
+            if card.get("market_price") is not None:
+                badge_text = f"TCG Mkt {card['market_price']:.2f}"
             else:
                 badge_text = "Sold blocked"
     else:
-        market, finish = pick_tcgplayer_market(card)
-        badge_text = f"TCG Mkt {market:.2f}" if market is not None else "—"
+        if card.get("market_price") is not None:
+            badge_text = f"TCG Mkt {card['market_price']:.2f}"
+        else:
+            badge_text = "—"
 
     tile = card_tile_html(img, name, subtitle, badge_text)
-
     with cols[idx % cols_per_row]:
         st.markdown(tile, unsafe_allow_html=True)
 
     label = f"{name} — {subtitle}"
     card_labels.append(label)
-    card_map[label] = {
-        "card": card,
-        "keywords": keywords,
-        "ebay_summary": ebay_summary,
-        "ebay_error": ebay_error,
-    }
+    card_map[label] = {"card": card, "keywords": keywords, "ebay_summary": ebay_summary, "ebay_error": ebay_error}
 
 st.divider()
 
-# Detail section
+# Details
 st.header("Details")
 selected = st.selectbox("Pick a card printing for details", options=card_labels)
 
@@ -448,17 +554,11 @@ keywords = selected_obj["keywords"]
 ebay_summary = selected_obj["ebay_summary"]
 ebay_error = selected_obj["ebay_error"]
 
-name = card.get("name", "Unknown")
-number = card.get("number", "?")
-set_name = (card.get("set") or {}).get("name", "Unknown set")
-img = (card.get("images") or {}).get("large") or (card.get("images") or {}).get("small")
-
 left, right = st.columns([1, 2])
 with left:
-    st.subheader(f"{name}")
-    st.caption(f"{number} • {set_name}")
-    st.image(img, use_container_width=True)
-
+    st.subheader(card["name"])
+    st.caption(f"{card['number']} • {card['set_name']}")
+    st.image(card["image_large"] or card["image_small"], use_container_width=True)
     if keywords:
         st.caption("eBay keywords used")
         st.code(keywords, language="text")
@@ -472,7 +572,7 @@ with right:
         m3.metric("Lowest", money_fmt(ebay_summary["low"], c))
         m4.metric("Samples", str(ebay_summary["count"]))
 
-        # Fetch full sold items (only for selected card) to show table
+        # Fetch fresh table for selected card
         ebay_full = ebay_find_completed_items(
             build_ebay_keywords(card),
             days=days,
@@ -501,16 +601,13 @@ with right:
     elif do_ebay and ebay_error:
         st.error("Could not fetch sold listings from eBay (likely restricted for completed items).")
         st.code(ebay_error, language="text")
+        if card.get("market_price") is not None:
+            st.metric("Market (fallback)", f"{card['market_price']:.2f}")
         st.info(
-            "If you later gain Marketplace Insights access, we can swap the backend to the official sold-history API."
+            "eBay sold-history is often behind Marketplace Insights access for many developers. [8](https://api.pokemontcg.io/v2/cards?page=1&pageSize=100)[9](https://publicapis.io/pokemon-tcg-api)"
         )
-
-        market, finish = pick_tcgplayer_market(card)
-        if market is not None:
-            st.metric("TCGplayer Market (fallback)", f"{market:.2f}")
     else:
-        market, finish = pick_tcgplayer_market(card)
-        if market is not None:
-            st.metric("TCGplayer Market", f"{market:.2f}")
+        if card.get("market_price") is not None:
+            st.metric("Market", f"{card['market_price']:.2f}")
         else:
-            st.info("No eBay or TCGplayer price data available for this card.")
+            st.info("No eBay sold data or market price available for this card.")
