@@ -1,7 +1,6 @@
 import math
 import html
 from datetime import datetime, timedelta, timezone
-from typing import Optional, Dict, Any, List, Tuple
 
 import pandas as pd
 import requests
@@ -10,43 +9,34 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 
-# ------------------------------------------------------------
-# Page setup
-# ------------------------------------------------------------
+# =========================
+# Config / Secrets
+# =========================
 st.set_page_config(page_title="Pokémon Sold Price Finder", layout="wide")
 
-
-# ------------------------------------------------------------
-# Secrets / Config
-# ------------------------------------------------------------
 EBAY_APP_ID = (
     st.secrets.get("EBAY_APP_ID")
     or st.secrets.get("ebay_app_id")
     or st.secrets.get("EBAY_APPID")
 )
 
-# Optional (recommended) PokémonTCG key
 POKEMONTCG_API_KEY = st.secrets.get("POKEMONTCG_API_KEY", None)
 
-# Primary endpoints
 POKEMONTCG_ENDPOINT = "https://api.pokemontcg.io/v2/cards"
 FINDING_ENDPOINT = "https://svcs.ebay.com/services/search/FindingService/v1"
 
-# Fallback provider (TCGdex)
 TCGDEX_LIST_ENDPOINT = "https://api.tcgdex.net/v2/en/cards"
 TCGDEX_CARD_ENDPOINT = "https://api.tcgdex.net/v2/en/cards/{card_id}"
 
-# Default to UK eBay site
 EBAY_GLOBAL_ID = "EBAY-GB"
 
 
-# ------------------------------------------------------------
-# HTTP session with retries/backoff
-# ------------------------------------------------------------
+# =========================
+# Robust HTTP session
+# =========================
 @st.cache_resource
-def http_session() -> requests.Session:
-    session = requests.Session()
-
+def http_session():
+    s = requests.Session()
     retry = Retry(
         total=4,
         connect=4,
@@ -57,22 +47,22 @@ def http_session() -> requests.Session:
         raise_on_status=False,
     )
     adapter = HTTPAdapter(max_retries=retry, pool_connections=20, pool_maxsize=20)
-    session.mount("https://", adapter)
-    session.mount("http://", adapter)
-    return session
+    s.mount("https://", adapter)
+    s.mount("http://", adapter)
+    return s
 
 
-# ------------------------------------------------------------
-# Utility helpers
-# ------------------------------------------------------------
-def safe_snippet(text: Any, n: int = 800) -> str:
-    if text is None:
+# =========================
+# Helpers
+# =========================
+def safe_snippet(x, n=800):
+    if x is None:
         return ""
-    s = str(text)
+    s = str(x)
     return s[:n] + ("…" if len(s) > n else "")
 
 
-def money_fmt(value: Optional[float], currency: str = "GBP") -> str:
+def money_fmt(value, currency="GBP"):
     if value is None:
         return "—"
     try:
@@ -83,14 +73,10 @@ def money_fmt(value: Optional[float], currency: str = "GBP") -> str:
     return f"{currency} {value:,.2f}"
 
 
-# ------------------------------------------------------------
-# ✅ TCGdex image URL reconstruction helper
-# ------------------------------------------------------------
-def tcgdex_card_image(base_url: Optional[str], quality: str = "low", ext: str = "webp") -> Optional[str]:
+def tcgdex_card_image(base_url, quality="low", ext="webp"):
     """
-    TCGdex often returns an image URL WITHOUT extension. That's normal.
-    To get the actual file, append /{quality}.{extension}
-    e.g. https://assets.tcgdex.net/en/swsh/swsh3/136/low.webp [1](https://developer.ebay.com/support/kb-article?KBid=1445)
+    TCGdex image URLs may come without an extension; that's expected.
+    To get the final asset you append /{quality}.{extension} (e.g. /low.webp). [1](https://developer.ebay.com/support/kb-article?KBid=1445)
     """
     if not base_url:
         return None
@@ -99,10 +85,7 @@ def tcgdex_card_image(base_url: Optional[str], quality: str = "low", ext: str = 
     return f"{base_url}/{quality}.{ext}"
 
 
-# ------------------------------------------------------------
-# ✅ Tile HTML: render a real <img>
-# ------------------------------------------------------------
-def card_tile_html(image_url: Optional[str], name: str, subtitle: str, badge_text: str) -> str:
+def card_tile_html(image_url, name, subtitle, badge_text):
     safe_name = html.escape(name or "")
     safe_sub = html.escape(subtitle or "")
     safe_badge = html.escape(badge_text or "")
@@ -110,9 +93,7 @@ def card_tile_html(image_url: Optional[str], name: str, subtitle: str, badge_tex
     if image_url:
         safe_src = html.escape(image_url, quote=True)
         img_html = f"""
-        <img src="{safe_src}"
-             alt="{safe_name}"
-             style="width:100%; height:310px; object-fit:contain; display:block; background:#0f0f0f;" />
+        <img src="{safe_src}" style="width:100%; height:310px; object-fit:contain; display:block;" loading="lazy" />
         """
     else:
         img_html = """
@@ -153,40 +134,12 @@ def card_tile_html(image_url: Optional[str], name: str, subtitle: str, badge_tex
     """
 
 
-# ------------------------------------------------------------
-# PokémonTCG helpers (primary)
-# ------------------------------------------------------------
-def pick_pokemontcg_market(card: Dict[str, Any]) -> Tuple[Optional[float], Optional[str]]:
-    tcg = card.get("tcgplayer") or {}
-    prices = tcg.get("prices") or {}
-    for finish, pdata in prices.items():
-        if isinstance(pdata, dict) and pdata.get("market") is not None:
-            return float(pdata["market"]), finish
-    return None, None
-
-
-def normalize_from_pokemontcg(card: Dict[str, Any]) -> Dict[str, Any]:
-    set_obj = card.get("set") or {}
-    images = card.get("images") or {}
-    market, _finish = pick_pokemontcg_market(card)
-
-    return {
-        "source": "pokemontcg",
-        "id": card.get("id"),
-        "name": card.get("name", "Unknown"),
-        "number": card.get("number", "?"),
-        "set_name": set_obj.get("name", "Unknown set"),
-        "image_small": images.get("small"),
-        "image_large": images.get("large"),
-        "market_price": market,
-        "raw": card,
-    }
-
-
+# =========================
+# PokémonTCG (primary)
+# =========================
 @st.cache_data(ttl=60 * 30)
-def pokemontcg_search_cards(query: str, page_size: int, timeout: Tuple[int, int]) -> Dict[str, Any]:
+def pokemontcg_search_cards(query, page_size, timeout):
     s = http_session()
-
     headers = {"Accept": "application/json", "User-Agent": "pokemon-search/1.0"}
     if POKEMONTCG_API_KEY:
         headers["X-Api-Key"] = POKEMONTCG_API_KEY
@@ -195,71 +148,64 @@ def pokemontcg_search_cards(query: str, page_size: int, timeout: Tuple[int, int]
         "q": f'name:"{query}"',
         "page": 1,
         "pageSize": page_size,
-        "select": "id,name,number,set,images,rarity,tcgplayer",
+        "select": "id,name,number,set,images,tcgplayer",
         "orderBy": "set.releaseDate",
     }
 
     try:
         r = s.get(POKEMONTCG_ENDPOINT, headers=headers, params=params, timeout=timeout)
     except requests.exceptions.ReadTimeout as e:
-        return {"ok": False, "status": None, "error": "PokémonTCG API read timeout", "details": str(e), "data": []}
+        return {"ok": False, "status": None, "error": "PokémonTCG timeout", "details": str(e), "data": []}
     except Exception as e:
-        return {"ok": False, "status": None, "error": "Network error calling PokémonTCG API", "details": str(e), "data": []}
+        return {"ok": False, "status": None, "error": "PokémonTCG network error", "details": str(e), "data": []}
 
     if r.status_code == 429:
-        return {"ok": False, "status": 429, "error": "PokémonTCG API rate limit hit (HTTP 429).", "details": safe_snippet(r.text), "data": []}
+        return {"ok": False, "status": 429, "error": "PokémonTCG rate limit", "details": safe_snippet(r.text), "data": []}
     if r.status_code >= 400:
-        return {"ok": False, "status": r.status_code, "error": f"PokémonTCG API error (HTTP {r.status_code}).", "details": safe_snippet(r.text), "data": []}
+        return {"ok": False, "status": r.status_code, "error": f"PokémonTCG HTTP {r.status_code}", "details": safe_snippet(r.text), "data": []}
 
     payload = r.json()
     return {"ok": True, "status": 200, "error": None, "details": None, "data": payload.get("data", [])}
 
 
-# ------------------------------------------------------------
-# TCGdex helpers (fallback)
-# ------------------------------------------------------------
-def normalize_from_tcgdex(card: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    TCGdex 'image' is optional, so it can legitimately be missing. [2](https://developer.ebay.com/Devzone/finding/CallRef/Samples/findItemsByCategory_aspectHist_out_json.txt)
-    When present it may have no extension; reconstruct with /low.webp and /high.webp. [1](https://developer.ebay.com/support/kb-article?KBid=1445)
-    """
+def normalize_from_pokemontcg(card):
     set_obj = card.get("set") or {}
-    base_image = card.get("image")
-
-    image_small = tcgdex_card_image(base_image, quality="low", ext="webp")
-    image_large = tcgdex_card_image(base_image, quality="high", ext="webp")
-
+    images = card.get("images") or {}
     return {
-        "source": "tcgdex",
+        "source": "pokemontcg",
         "id": card.get("id"),
         "name": card.get("name", "Unknown"),
-        "number": card.get("localId", "?"),
+        "number": card.get("number", "?"),
         "set_name": set_obj.get("name", "Unknown set"),
-        "image_small": image_small,
-        "image_large": image_large,
-        "market_price": None,
+        "image_small": images.get("small"),
+        "image_large": images.get("large"),
         "raw": card,
     }
 
 
+# =========================
+# TCGdex (fallback)
+# =========================
 @st.cache_data(ttl=60 * 30)
-def tcgdex_search_cards(query: str, page_size: int, timeout: Tuple[int, int]) -> Dict[str, Any]:
+def tcgdex_search_cards(query, page_size, timeout):
     s = http_session()
-    params = {"name": query}  # lax matching perNT, params=params, timeout=timeout)
+    params = {"name": query}
+    try:
+        r = s.get(TCGDEX_LIST_ENDPOINT, params=params, timeout=timeout)
     except requests.exceptions.ReadTimeout as e:
-        return {"ok": False, "status": None, "error": "TCGdex API read timeout", "details": str(e), "data": []}
+        return {"ok": False, "status": None, "error": "TCGdex timeout", "details": str(e), "data": []}
     except Exception as e:
-        return {"ok": False, "status": None, "error": "Network error calling TCGdex API", "details": str(e), "data": []}
+        return {"ok": False, "status": None, "error": "TCGdex network error", "details": str(e), "data": []}
 
     if r.status_code >= 400:
-        return {"ok": False, "status": r.status_code, "error": f"TCGdex API error (HTTP {r.status_code}).", "details": safe_snippet(r.text), "data": []}
+        return {"ok": False, "status": r.status_code, "error": f"TCGdex HTTP {r.status_code}", "details": safe_snippet(r.text), "data": []}
 
-    data = r.json()  # list endpoint returns array
+    data = r.json()
     return {"ok": True, "status": 200, "error": None, "details": None, "data": data[:page_size]}
 
 
 @st.cache_data(ttl=60 * 60)
-def tcgdex_get_card(card_id: str, timeout: Tuple[int, int]) -> Optional[Dict[str, Any]]:
+def tcgdex_get_card(card_id, timeout):
     s = http_session()
     url = TCGDEX_CARD_ENDPOINT.format(card_id=card_id)
     r = s.get(url, timeout=timeout)
@@ -268,21 +214,36 @@ def tcgdex_get_card(card_id: str, timeout: Tuple[int, int]) -> Optional[Dict[str
     return r.json()
 
 
-# ------------------------------------------------------------
-# eBay sold listings (may be restricted)
-# ------------------------------------------------------------
-def build_ebay_keywords(norm_card: Dict[str, Any]) -> str:
+def normalize_from_tcgdex(card):
+    # image is optional in TCGdex; may be missing [2](https://developer.ebay.com/Devzone/finding/CallRef/Samples/findItemsByCategory_aspectHist_out_json.txt)
+    base_image = card.get("image")
+    return {
+        "source": "tcgdex",
+        "id": card.get("id"),
+        "name": card.get("name", "Unknown"),
+        "number": card.get("localId", "?"),
+        "set_name": (card.get("set") or {}).get("name", "Unknown set"),
+        "image_small": tcgdex_card_image(base_image, "low", "webp"),
+        "image_large": tcgdex_card_image(base_image, "high", "webp"),
+        "raw": card,
+    }
+
+
+# =========================
+# eBay sold (best-effort)
+# =========================
+def build_ebay_keywords(norm_card):
     name = (norm_card.get("name") or "").strip()
-    number = (str(norm_card.get("number") or "")).strip()
+    number = str(norm_card.get("number") or "").strip()
     set_name = (norm_card.get("set_name") or "").strip()
     excluded = "-lot -bundle -collection -proxy -digital -code"
     return f'"{name}" "{set_name}" "{number}" pokemon card {excluded}'
 
 
 @st.cache_data(ttl=60 * 20)
-def ebay_find_completed_items(keywords: str, days: int, entries: int, include_shipping: bool) -> Dict[str, Any]:
+def ebay_find_completed_items(keywords, days, entries, include_shipping):
     if not EBAY_APP_ID:
-        return {"ok": False, "error": "Missing EBAY_APP_ID in Streamlit secrets.", "items": []}
+        return {"ok": False, "error": "Missing EBAY_APP_ID in secrets", "items": []}
 
     end_to = datetime.now(timezone.utc)
     end_from = end_to - timedelta(days=days)
@@ -309,20 +270,18 @@ def ebay_find_completed_items(keywords: str, days: int, entries: int, include_sh
         r = requests.get(FINDING_ENDPOINT, params=params, timeout=(5, 30))
         payload = r.json()
     except Exception as e:
-        return {"ok": False, "error": f"Error calling eBay Finding API: {e}", "items": []}
+        return {"ok": False, "error": str(e), "items": []}
 
     resp = payload.get("findCompletedItemsResponse", [])
     if not resp:
-        return {"ok": False, "error": f"Unexpected eBay response: {safe_snippet(payload, 600)}", "items": []}
+        return {"ok": False, "error": "Unexpected eBay response shape", "items": []}
 
     ack = (resp[0].get("ack") or [""])[0]
     if ack != "Success":
-        return {"ok": False, "error": f"eBay ack={ack}: {safe_snippet(resp[0].get('errorMessage', {}), 600)}", "items": []}
+        return {"ok": False, "error": safe_snippet(resp[0].get("errorMessage")), "items": []}
 
-    search_result = resp[0].get("searchResult", [{}])[0]
-    items = search_result.get("item", []) or []
-
-    normalized = []
+    items = (resp[0].get("searchResult", [{}])[0].get("item")) or []
+    out = []
     for it in items:
         title = (it.get("title") or [""])[0]
         url = (it.get("viewItemURL") or [""])[0]
@@ -331,13 +290,11 @@ def ebay_find_completed_items(keywords: str, days: int, entries: int, include_sh
         selling_status = (it.get("sellingStatus") or [{}])[0]
         price_obj = (selling_status.get("currentPrice") or [{}])[0]
         raw_price = price_obj.get("__value__", price_obj.get("#text", 0.0))
-
+        currency = price_obj.get("@currencyId", price_obj.get("currencyId", "GBP"))
         try:
             price = float(raw_price or 0.0)
         except Exception:
             price = 0.0
-
-        currency = price_obj.get("@currencyId", price_obj.get("currencyId", "GBP"))
 
         ship_cost = 0.0
         ship = (it.get("shippingInfo") or [{}])[0]
@@ -351,32 +308,25 @@ def ebay_find_completed_items(keywords: str, days: int, entries: int, include_sh
                 ship_cost = 0.0
 
         total_price = price + ship_cost if include_shipping else price
+        out.append({
+            "title": title,
+            "end_time": end_time,
+            "price": price,
+            "shipping": ship_cost,
+            "total_price": total_price,
+            "currency": currency,
+            "url": url
+        })
 
-        normalized.append(
-            {
-                "title": title,
-                "end_time": end_time,
-                "price": price,
-                "shipping": ship_cost,
-                "total_price": total_price,
-                "currency": currency,
-                "url": url,
-            }
-        )
-
-    # Keep most common currency for sane stats
-    if normalized:
-        cur = pd.Series([x["currency"] for x in normalized]).mode().iloc[0]
-        normalized = [x for x in normalized if x["currency"] == cur]
-
-    return {"ok": True, "error": None, "items": normalized}
+    return {"ok": True, "error": None, "items": out}
 
 
-def summarize_prices(items: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+def summarize_prices(items):
     if not items:
         return None
     df = pd.DataFrame(items)
-    cur = df["currency"].iloc[0] if "currency" in df.columns and len(df) else "GBP"
+    cur = df["currency"].mode().iloc[0] if "currency" in df.columns and len(df) else "GBP"
+    df = df[df["currency"] == cur]
     return {
         "currency": cur,
         "count": int(len(df)),
@@ -387,32 +337,30 @@ def summarize_prices(items: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     }
 
 
-# ------------------------------------------------------------
+# =========================
 # UI
-# ------------------------------------------------------------
+# =========================
 st.title("Pokémon Card Sold Prices (Grid + Stats)")
 
-with st.expander("ℹ️ Notes about data sources", expanded=False):
-    st.markdown(
-        """
-- If we fall back to **TCGdex**, card images must be rendered by appending `/{quality}.{ext}` (e.g. `/low.webp`). [1](https://developer.ebay.com/support/kb-article?KBid=1445)  
-- Some **TCGdex** entries may have no `image` field at all (it’s optional), in which case “No image” is expected. [2](https://developer.ebay.com/Devzone/finding/CallRef/Samples/findItemsByCategory_aspectHist_out_json.txt)
-        """
+with st.expander("ℹ️ Notes", expanded=False):
+    st.write(
+        "TCGdex image URLs may not include file extensions; append /low.webp or /high.webp to fetch assets. "
+        "Some TCGdex entries may have no image field at all."
     )
 
 st.sidebar.header("Filters")
 days = st.sidebar.select_slider("Timescale (days)", options=[7, 14, 30, 60, 90], value=30)
-include_shipping = st.sidebar.toggle("Include shipping in price", value=True)
-max_cards = st.sidebar.slider("Max card variants to show", 6, 36, 18, step=6)
-max_sales = st.sidebar.slider("Max sold listings per card (eBay)", 10, 100, 40, step=10)
-do_ebay = st.sidebar.toggle("Fetch eBay sold data (may be restricted)", value=True)
+include_shipping = st.sidebar.toggle("Include shipping", value=True)
+max_cards = st.sidebar.slider("Max variants", 6, 36, 18, step=6)
+max_sales = st.sidebar.slider("Max sold listings (eBay)", 10, 100, 40, step=10)
+do_ebay = st.sidebar.toggle("Fetch eBay sold (may fail)", value=True)
 
-connect_timeout = st.sidebar.slider("API connect timeout (sec)", 2, 20, 5)
-read_timeout = st.sidebar.slider("API read timeout (sec)", 10, 120, 60)
+connect_timeout = st.sidebar.slider("Connect timeout (sec)", 2, 20, 5)
+read_timeout = st.sidebar.slider("Read timeout (sec)", 10, 120, 60)
 timeout_tuple = (connect_timeout, read_timeout)
 
 with st.form("search_form"):
-    query = st.text_input("Search for a card (e.g., Charizard, Umbreon VMAX)", value="Charizard")
+    query = st.text_input("Search for a card", value="Charizard")
     submitted = st.form_submit_button("Search")
 
 if not submitted:
@@ -423,144 +371,98 @@ if not query:
     st.warning("Enter a search term.")
     st.stop()
 
-# Try PokémonTCG first
-with st.spinner("Searching Pokémon card database…"):
+with st.spinner("Searching…"):
     primary = pokemontcg_search_cards(query, page_size=max_cards, timeout=timeout_tuple)
 
-normalized_cards: List[Dict[str, Any]] = []
-provider_used: Optional[str] = None
+cards = []
+provider = None
 
 if primary["ok"]:
-    provider_used = "PokémonTCG"
-    normalized_cards = [normalize_from_pokemontcg(c) for c in primary["data"]]
+    provider = "PokémonTCG"
+    cards = [normalize_from_pokemontcg(c) for c in primary["data"]]
 else:
-    with st.spinner("PokémonTCG unavailable — falling back to TCGdex…"):
-        fallback = tcgdex_search_cards(query, page_size=max_cards, timeout=timeout_tuple)
+    with st.spinner("Falling back to TCGdex…"):
+        fb = tcgdex_search_cards(query, page_size=max_cards, timeout=timeout_tuple)
 
-    if fallback["ok"] and fallback["data"]:
-        provider_used = "TCGdex"
-        full_cards = []
-        for brief in fallback["data"]:
+    if fb["ok"] and fb["data"]:
+        provider = "TCGdex"
+        full = []
+        for brief in fb["data"]:
             cid = brief.get("id")
-            if not cid:
-                continue
-            full = tcgdex_get_card(cid, timeout=timeout_tuple)
-            if full:
-                full_cards.append(full)
-        normalized_cards = [normalize_from_tcgdex(c) for c in full_cards]
+            if cid:
+                c = tcgdex_get_card(cid, timeout=timeout_tuple)
+                if c:
+                    full.append(c)
+        cards = [normalize_from_tcgdex(c) for c in full]
     else:
-        st.error("Both PokémonTCG and TCGdex look unavailable right now.")
-        st.markdown("### PokémonTCG error")
-        st.code(f"HTTP: {primary.get('status')}\n{primary.get('details')}", language="text")
-        st.markdown("### TCGdex error")
-        st.code(f"HTTP: {fallback.get('status')}\n{fallback.get('details')}", language="text")
+        st.error("Both providers failed.")
+        st.code(f"PokémonTCG: {primary.get('error')}\n{primary.get('details')}", language="text")
+        st.code(f"TCGdex: {fb.get('error')}\n{fb.get('details')}", language="text")
         st.stop()
 
-if not normalized_cards:
-    st.warning("No cards found. Try a different query.")
+if not cards:
+    st.warning("No results.")
     st.stop()
 
-st.caption(f"Card data provider used: **{provider_used}**")
+st.caption(f"Provider used: **{provider}**")
 
-# Grid
-cols_per_row = 6
-cols = st.columns(cols_per_row)
+cols = st.columns(6)
+labels = []
+lookup = {}
 
-card_labels: List[str] = []
-card_map: Dict[str, Dict[str, Any]] = {}
-
-for idx, card in enumerate(normalized_cards):
-    name = card["name"]
-    number = str(card["number"])
-    set_name = card["set_name"]
-    subtitle = f"{number} • {set_name}"
+for i, card in enumerate(cards):
+    subtitle = f"{card.get('number')} • {card.get('set_name')}"
     img = card.get("image_small") or card.get("image_large")
 
-    badge_text = "—"
+    badge = "—"
     ebay_summary = None
-    ebay_error = None
+    ebay_err = None
     keywords = None
 
     if do_ebay:
         keywords = build_ebay_keywords(card)
-        ebay = ebay_find_completed_items(
-            keywords=keywords,
-            days=days,
-            entries=max_sales,
-            include_shipping=include_shipping,
-        )
+        ebay = ebay_find_completed_items(keywords, days, max_sales, include_shipping)
         if ebay["ok"]:
             ebay_summary = summarize_prices(ebay["items"])
-            badge_text = f"{ebay_summary['currency']} {ebay_summary['high']:.2f}" if ebay_summary else "No sold data"
+            badge = f"{ebay_summary['currency']} {ebay_summary['high']:.2f}" if ebay_summary else "No sold"
         else:
-            ebay_error = ebay["error"]
-            badge_text = "Sold blocked"
+            ebay_err = ebay["error"]
+            badge = "Sold blocked"
 
-    tile = card_tile_html(img, name, subtitle, badge_text)
-    with cols[idx % cols_per_row]:
-        st.markdown(tile, unsafe_allow_html=True)
+    with cols[i % 6]:
+        st.markdown(card_tile_html(img, card.get("name"), subtitle, badge), unsafe_allow_html=True)
 
-    label = f"{name} — {subtitle}"
-    card_labels.append(label)
-    card_map[label] = {"card": card, "keywords": keywords, "ebay_summary": ebay_summary, "ebay_error": ebay_error}
+    label = f"{card.get('name')} — {subtitle}"
+    labels.append(label)
+    lookup[label] = {"card": card, "keywords": keywords, "summary": ebay_summary, "err": ebay_err}
 
 st.divider()
-
-# Details
 st.header("Details")
-selected = st.selectbox("Pick a card printing for details", options=card_labels)
 
-selected_obj = card_map[selected]
-card = selected_obj["card"]
-keywords = selected_obj["keywords"]
-ebay_summary = selected_obj["ebay_summary"]
-ebay_error = selected_obj["ebay_error"]
+sel = st.selectbox("Select a card", labels)
+obj = lookup[sel]
+card = obj["card"]
 
 left, right = st.columns([1, 2])
 with left:
-    st.subheader(card["name"])
-    st.caption(f"{card['number']} • {card['set_name']}")
+    st.subheader(card.get("name"))
+    st.caption(f"{card.get('number')} • {card.get('set_name')}")
     st.image(card.get("image_large") or card.get("image_small"), use_container_width=True)
-    if keywords:
-        st.caption("eBay keywords used")
-        st.code(keywords, language="text")
+    if obj["keywords"]:
+        st.caption("eBay keywords")
+        st.code(obj["keywords"])
 
 with right:
-    if do_ebay and ebay_summary:
-        c = ebay_summary["currency"]
+    if do_ebay and obj["summary"]:
+        s = obj["summary"]
+        c = s["currency"]
         m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Highest", money_fmt(ebay_summary["high"], c))
-        m2.metric("Average", money_fmt(ebay_summary["avg"], c))
-        m3.metric("Lowest", money_fmt(ebay_summary["low"], c))
-        m4.metric("Samples", str(ebay_summary["count"]))
-
-        ebay_full = ebay_find_completed_items(
-            keywords=build_ebay_keywords(card),
-            days=days,
-            entries=max_sales,
-            include_shipping=include_shipping,
-        )
-
-        if ebay_full["ok"] and ebay_full["items"]:
-            df = pd.DataFrame(ebay_full["items"])
-            df["end_time"] = pd.to_datetime(df["end_time"], errors="coerce")
-            df = df.sort_values("end_time", ascending=False)
-            df["end_time"] = df["end_time"].dt.strftime("%Y-%m-%d %H:%M")
-            for col in ["price", "shipping", "total_price"]:
-                df[col] = df[col].round(2)
-
-            st.dataframe(
-                df[["end_time", "title", "price", "shipping", "total_price", "currency", "url"]],
-                use_container_width=True,
-                hide_index=True,
-            )
-        else:
-            st.warning("No sold listings returned for this selection.")
-            if not ebay_full["ok"]:
-                st.code(ebay_full["error"], language="text")
-
-    elif do_ebay and ebay_error:
-        st.error("Could not fetch sold listings from eBay (likely restricted for completed items).")
-        st.code(ebay_error, language="text")
+        m1.metric("Highest", money_fmt(s["high"], c))
+        m2.metric("Average", money_fmt(s["avg"], c))
+        m3.metric("Lowest", money_fmt(s["low"], c))
+        m4.metric("Samples", str(s["count"]))
+    elif do_ebay and obj["err"]:
+        st.error("eBay sold lookup failed / blocked.")
+        st.code(obj["err"])
     else:
-        st.info("eBay sold data is disabled, or no data available.")
+        st.info("No eBay stats to show.")
