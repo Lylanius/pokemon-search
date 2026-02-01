@@ -1,45 +1,53 @@
-import os
-from dotenv import load_dotenv
-import base64
+# app.py
+import streamlit as st
 import requests
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 from datetime import datetime, timezone
-import gradio as gr
 
 # --------------------------
-# LOAD ENV
+# CONFIG / SECRETS
 # --------------------------
-load_dotenv()
-POKEMON_API_KEY = os.getenv("POKEMON_API_KEY")
-EBAY_APP_ID     = os.getenv("EBAY_APP_ID")
-EBAY_CERT_ID    = os.getenv("EBAY_CERT_ID")
+POKEMON_API_KEY = st.secrets["POKEMON_API_KEY"]
+EBAY_APP_ID     = st.secrets["EBAY_APP_ID"]
+EBAY_CERT_ID    = st.secrets["EBAY_CERT_ID"]
 DEFAULT_COMPS_LIMIT = 20
-
-# --------------------------
-# POKEMON PRICE TRACKER
-# --------------------------
 API_ROOT = "https://www.pokemonpricetracker.com/api/v2"
 
-def _auth_header():
+# --------------------------
+# HELPERS
+# --------------------------
+def auth_header():
     return {"Authorization": f"Bearer {POKEMON_API_KEY}"}
 
+def parse_iso(dt_str):
+    if not dt_str:
+        return None
+    s = dt_str.replace("Z", "+00:00")
+    try:
+        return datetime.fromisoformat(s)
+    except Exception:
+        return None
+
+# --------------------------
+# POKEMON PRICE TRACKER API
+# --------------------------
 def search_card(query: str):
-    r = requests.get(f"{API_ROOT}/cards", headers=_auth_header(), params={"q": query}, timeout=20)
+    r = requests.get(f"{API_ROOT}/cards", headers=auth_header(), params={"q": query}, timeout=20)
     r.raise_for_status()
     payload = r.json()
     return payload.get("cards") or payload.get("data") or []
 
 def get_card_price(card_id: str):
-    r = requests.get(f"{API_ROOT}/cards/{card_id}", headers=_auth_header(), timeout=20)
+    r = requests.get(f"{API_ROOT}/cards/{card_id}", headers=auth_header(), timeout=20)
     r.raise_for_status()
     return r.json()
 
 def get_price_history(card_id: str, days: int = 30, limit: int = 20):
-    params = {"days": days, "limit": limit}
-    r = requests.get(f"{API_ROOT}/cards/{card_id}/history", headers=_auth_header(), params=params, timeout=20)
+    params = {"days": int(days), "limit": int(limit)}
+    r = requests.get(f"{API_ROOT}/cards/{card_id}/history", headers=auth_header(), params=params, timeout=20)
     r.raise_for_status()
     data = r.json()
     if isinstance(data, dict) and "history" in data:
@@ -47,8 +55,10 @@ def get_price_history(card_id: str, days: int = 30, limit: int = 20):
     return (data or [])[:limit]
 
 # --------------------------
-# eBay Browse API
+# EBAY BROWSE API
 # --------------------------
+import base64
+
 def get_ebay_token():
     url = "https://api.ebay.com/identity/v1/oauth2/token"
     encoded = base64.b64encode(f"{EBAY_APP_ID}:{EBAY_CERT_ID}".encode()).decode()
@@ -62,149 +72,93 @@ def get_ebay_token():
 
 def get_ebay_live_listings(keywords: str, limit: int = 10, uk_only: bool = True):
     token = get_ebay_token()
-    if not token: return []
+    if not token:
+        return []
     headers = {
         "Authorization": f"Bearer {token}",
         "X-EBAY-C-MARKETPLACE-ID": "EBAY_GB" if uk_only else "EBAY_US"
     }
     params = {"q": keywords, "limit": limit}
-    if uk_only: params["filter"] = "itemLocationCountry:GB"
+    if uk_only:
+        params["filter"] = "itemLocationCountry:GB"
     r = requests.get("https://api.ebay.com/buy/browse/v1/item_summary/search",
                      headers=headers, params=params, timeout=20)
     r.raise_for_status()
     items = []
     for i in r.json().get("itemSummaries", []):
-        try: price = float(i["price"]["value"])
-        except: continue
-        items.append({"title": i.get("title",""), "price": price, "url": i.get("itemWebUrl","")})
+        try:
+            price = float(i["price"]["value"])
+        except Exception:
+            continue
+        items.append({
+            "title": i.get("title",""),
+            "price": price,
+            "url":   i.get("itemWebUrl") or i.get("itemAffiliateWebUrl","")
+        })
     return items
 
 # --------------------------
-# HELPERS
+# STREAMLIT UI
 # --------------------------
-def parse_iso(dt_str: str):
-    if not dt_str: return None
-    s = dt_str.replace("Z","+00:00")
-    try: return datetime.fromisoformat(s)
-    except: return None
+st.set_page_config(page_title="Poké-Quant Tracker", layout="wide")
 
-def price_link(label, price):
-    try: return f"{label}: £{float(price):.2f}<br>"
-    except: return f"{label}: —<br>"
+st.title("Poké-Quant Master Dashboard")
 
-# --------------------------
-# SHOW CARD DATA
-# --------------------------
-def show_card_data(card_id: str, comps_limit: int, days: int):
-    card_price = get_card_price(card_id)
-    name = card_price.get("name","Unknown")
-    market_price = card_price.get("market_price",0)
-    low_price = card_price.get("low_price",0)
-    high_price = card_price.get("high_price",0)
+with st.sidebar:
+    search_query = st.text_input("Search Card", value="Pikachu")
+    comps_limit  = st.slider("Sold Comps", min_value=3, max_value=50, value=DEFAULT_COMPS_LIMIT)
+    days_window  = st.radio("Search Window (Days)", options=[30,60,90], index=2)
+    region_uk    = st.checkbox("UK only for eBay", value=True)
+    search_btn   = st.button("Search Card")
 
-    history = get_price_history(card_id, days=int(days), limit=int(comps_limit))
-    dates, prices = [], []
-    for h in history:
-        dt = parse_iso(h.get("date") or h.get("sold_at") or h.get("timestamp"))
-        pr = h.get("price") or h.get("sold_price")
-        if dt and pr is not None:
-            dates.append(dt)
-            prices.append(float(pr))
+if search_btn and search_query:
+    cards = search_card(search_query.strip())
+    if not cards:
+        st.warning("No cards found!")
+    else:
+        # Display gallery of cards
+        for idx, card in enumerate(cards[:12]):
+            st.image(card.get("image", ""), width=120, caption=f"{card.get('name','Unknown')}")
+        # Select first card by default
+        card_id = cards[0]["id"]
+        card_data = get_card_price(card_id)
+        st.subheader(f"{card_data.get('name','Unknown')} - Market Info")
+        st.write(f"Market Price: £{card_data.get('market_price',0):.2f}")
+        st.write(f"Low Price: £{card_data.get('low_price',0):.2f}")
+        st.write(f"High Price: £{card_data.get('high_price',0):.2f}")
 
-    sold_html = "<div class='stat-display'>" + price_link("MARKET", market_price) + price_link("LOW", low_price) + price_link("HIGH", high_price) + f"VOLUME: {len(prices)}</div>"
+        # Sold History
+        history = get_price_history(card_id, days=int(days_window), limit=int(comps_limit))
+        if history:
+            dates = [parse_iso(h.get("date") or h.get("sold_at") or h.get("timestamp")) for h in history]
+            prices = [h.get("price") or h.get("sold_price") for h in history]
+            df = pd.DataFrame({"Date": dates, "Price (£)": prices})
+            st.subheader("Sold History")
+            st.dataframe(df.sort_values("Date", ascending=False))
 
-    sold_plot = None
-    if dates:
-        fig, ax = plt.subplots(figsize=(7,3.5), facecolor='#1a1a1a')
-        ax.set_facecolor("#1a1a1a")
-        ax.scatter(dates, prices, color='#00ff00', s=40, label="Sold")
-        if len(prices) > 1:
-            x_nums = np.array([d.timestamp() for d in dates])
-            y_vals = np.array(prices)
-            coeffs = np.polyfit(x_nums - x_nums.mean(), y_vals, 1)
-            trend_y = np.polyval(coeffs, x_nums - x_nums.mean())
-            ax.plot(dates, trend_y, color='#ffaa00', linestyle='--', linewidth=1.5, label="Trend")
-        ax.axhline(float(market_price or 0), color='cyan', linestyle=':', linewidth=1, label=f"Market £{float(market_price or 0):.0f}")
-        ax.xaxis.set_major_formatter(mdates.DateFormatter('%d %b'))
-        fig.autofmt_xdate(rotation=30, ha='right')
-        ax.tick_params(colors='white', labelsize=8)
-        for spine in ax.spines.values(): spine.set_color('#555')
-        ax.set_ylabel("Price (£)", color='white', fontsize=9)
-        ax.legend(loc='upper left', fontsize=7, facecolor='#1a1a1a', edgecolor='#555', labelcolor='white')
-        ax.set_title(f"Sold Prices: {name}", color='white', fontsize=10)
-        plt.tight_layout()
-        sold_plot = fig
+            # Plot
+            fig, ax = plt.subplots(figsize=(8,3.5))
+            ax.scatter(dates, prices, color='green', label="Sold Prices")
+            if len(prices) > 1:
+                x_nums = np.array([d.timestamp() for d in dates])
+                y_vals = np.array(prices)
+                x_norm = x_nums - x_nums.mean()
+                coeffs = np.polyfit(x_norm, y_vals, 1)
+                trend_y = np.polyval(coeffs, x_norm)
+                ax.plot(dates, trend_y, color='orange', linestyle='--', label="Trend")
+            ax.set_ylabel("Price (£)")
+            ax.xaxis.set_major_formatter(mdates.DateFormatter('%d %b'))
+            fig.autofmt_xdate(rotation=30)
+            ax.legend()
+            st.pyplot(fig)
+        else:
+            st.info("No sold history available.")
 
-    sold_df = pd.DataFrame([{"Price": p, "Date": d.strftime("%Y-%m-%d")} for p,d in sorted(zip(prices, dates), key=lambda t: t[1], reverse=True)])
-
-    live_items = get_ebay_live_listings(name, limit=10)
-    live_html = "<div class='stat-display'>" + "".join([f"<a href='{li['url']}' target='_blank'>{li['title']}</a> - £{li['price']:.2f}<br>" for li in live_items]) + "</div>" if live_items else "<div class='stat-display'>No live listings found</div>"
-
-    return sold_html, sold_plot, sold_df, live_html
-
-# --------------------------
-# GRADIO UI
-# --------------------------
-css = """
-.pokedex-frame {
-    background: #dc0a2d;
-    border-radius: 20px;
-    padding: 20px;
-    border-bottom: 12px solid #8b0000;
-    box-shadow: 0 10px 0 #000;
-    color: white;
-}
-.stat-display {
-    background: #1a1a1a;
-    color: #00ff00;
-    font-family: 'IBM Plex Mono', monospace;
-    padding: 15px;
-    border-radius: 12px;
-    border: 2px solid #555;
-    font-size: 14px;
-    line-height: 1.6;
-}
-"""
-
-with gr.Blocks(css=css) as demo:
-    cards_state = gr.State([])
-
-    with gr.Column(elem_classes="pokedex-frame"):
-        gr.HTML("<h2 style='color:white;'>POKÉ‑QUANT MASTER</h2>")
-        with gr.Row():
-            search_in = gr.Textbox(label="SEARCH CARD", value="Pikachu")
-            comps_in  = gr.Slider(3,50,value=DEFAULT_COMPS_LIMIT,step=1,label="SOLD COMPS")
-            days_in   = gr.Radio(["30","60","90"],label="SEARCH WINDOW (DAYS)",value="90")
-
-        btn_search = gr.Button("SEARCH CARDS", variant="primary")
-        gallery = gr.Gallery(label="Results", columns=6, height=350, allow_preview=False)
-
-        with gr.Tabs():
-            with gr.Tab("📈 Live Listings"):
-                live_html = gr.HTML("<div class='stat-display'>Press search and select a card…</div>")
-            with gr.Tab("🏷️ Sold History"):
-                with gr.Row():
-                    sold_html = gr.HTML("<div class='stat-display'>Select a card to see sold history</div>")
-                    sold_plot = gr.Plot()
-                sold_df = gr.Dataframe(label="SOLD DATA LOG")
-
-    # Search callback
-    def do_search(q):
-        cards = search_card(q.strip())
-        tiles = [(c.get("image","https://via.placeholder.com/150"), f"{c.get('name','Unknown')}\n£{c.get('market_price',0):.2f}") for c in cards[:36]]
-        return tiles, cards
-
-    btn_search.click(do_search, [search_in], [gallery, cards_state])
-
-    # Selection callback
-    def on_gallery_select(evt: gr.SelectData, cards, comps, days):
-        idx = evt.index
-        if not cards or idx is None or idx >= len(cards):
-            return (gr.update(), None, pd.DataFrame(), gr.update())
-        card_id = cards[idx].get("id")
-        return show_card_data(card_id, int(comps), int(days))
-
-    gallery.select(on_gallery_select, [cards_state, comps_in, days_in],
-                   [sold_html, sold_plot, sold_df, live_html])
-
-demo.launch()
+        # Live eBay listings
+        st.subheader("Live eBay Listings")
+        live_items = get_ebay_live_listings(card_data.get("name",""), limit=10, uk_only=region_uk)
+        if live_items:
+            for li in live_items:
+                st.markdown(f"[{li['title']}]({li['url']}) - £{li['price']:.2f}")
+        else:
+            st.info("No live listings found.")
